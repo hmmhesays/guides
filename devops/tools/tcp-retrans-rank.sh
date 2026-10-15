@@ -1,15 +1,18 @@
 #!/bin/bash
-# Rank current TCP connections by lifetime retransmits, or group them by peer.
+# Rank current TCP connections by lifetime retransmits, group them by peer, or measure bandwidth.
 #
 # Modes:
 #   -s  simple    retransmits, segments sent, percent, local -> peer, process
 #   -a  advanced  adds direction and TCP state; direction inferred from listening ports (default)
 #   -c  conntrack like advanced, but direction is confirmed from the conntrack table where possible
 #   -p  peers     count connections by state, process, initiator -> acceptor:port and direction
+#   -b  bandwidth sample TCP byte counters for a few seconds and rank connections by kbit/s
+#   -A  all       run advanced, peers and bandwidth one after another in a single report
 #
 # Options:
 #   -f STATE  only show connections in this state, e.g. ESTAB, SYN-SENT, CLOSE-WAIT, TIME-WAIT
 #   -n N      show the top N lines (default 20)
+#   -i SECS   sampling interval for -b (default 5)
 #   -r        print standalone one-liners you can paste on a server without this script
 #   -h        show this help
 #
@@ -19,6 +22,7 @@ set -o pipefail
 
 TOP=20
 MODE=advanced
+INTERVAL=5
 STATE_FILTER=""
 
 usage() {
@@ -182,6 +186,58 @@ peers_report() {
     echo "DIR inferred from listening ports. PORT is the service port: local for in, remote for out."
 }
 
+# Prints "<local> <peer> <bytes_acked> <bytes_received> <name/pid>" for each TCP socket in the wanted state.
+bandwidth_snapshot() {
+    ss -tinpH | awk -v want="$STATE_FILTER" "$AWK_COMMON"'
+    /^[A-Z]/ { skip = !wanted($1); key = $4 " " $5; proc = proc_name($0); next }
+    {
+        if (skip) next
+        tx = rx = 0
+        if (match($0, /bytes_acked:[0-9]+/))    tx = substr($0, RSTART + 12, RLENGTH - 12)
+        if (match($0, /bytes_received:[0-9]+/)) rx = substr($0, RSTART + 15, RLENGTH - 15)
+        print key, tx, rx, proc
+    }'
+}
+
+# Takes two snapshots INTERVAL seconds apart and ranks connections by throughput.
+# Snapshots are held in shell variables, so no temp files are written.
+bandwidth_report() {
+    local before after
+    echo "Sampling TCP byte counters for ${INTERVAL}s..." >&2
+    before=$(bandwidth_snapshot)
+    sleep "$INTERVAL"
+    after=$(bandwidth_snapshot)
+    printf "%12s %12s %12s  %-50s %s\n" TOTAL_kbps TX_kbps RX_kbps "LOCAL -> PEER" PROCESS
+    {
+        printf '%s\n' "$before" | sed 's/^/A /'
+        printf '%s\n' "$after"  | sed 's/^/B /'
+    } | awk -v i="$INTERVAL" '
+    NF < 6 { next }
+    $1 == "A" { tx[$2 " " $3] = $4; rx[$2 " " $3] = $5; next }
+    {
+        t = ($4 - tx[$2 " " $3]) * 8 / 1000 / i
+        r = ($5 - rx[$2 " " $3]) * 8 / 1000 / i
+        if (t + r > 0) printf "%12.1f %12.1f %12.1f  %-50s %s\n", t + r, t, r, $2 " -> " $3, $6
+    }' | sort_and_trim
+    echo
+    echo "TCP payload only (bytes acked / received); UDP such as RTP is not included. Use iftop for UDP."
+}
+
+section() {
+    printf '\n===== %s =====\n' "$1"
+}
+
+# Runs advanced, peers and bandwidth in one go, with a header for each.
+all_report() {
+    echo "Host: $(hostname)   Time: $(date '+%Y-%m-%d %H:%M:%S %Z')${STATE_FILTER:+   State: $STATE_FILTER}"
+    section "RETRANSMITS (advanced)"
+    advanced_report
+    section "CONNECTIONS BY PEER"
+    peers_report
+    section "BANDWIDTH (${INTERVAL}s sample)"
+    bandwidth_report
+}
+
 # Standalone one-liners to copy and paste. The quoted heredoc is printed as-is, never run.
 reference() {
     cat <<'REFERENCE'
@@ -219,15 +275,39 @@ $2=="LISTEN" || NF<6 { next }
   if (lp in listen) print state, proc, rip " -> " lip ":" lp, "(in)"
   else              print state, proc, lip " -> " rip ":" rp, "(out)"
 }' | sort | uniq -c | sort -rn | head -30
+
+--- Bandwidth: sample TCP byte counters for I seconds, rank connections by kbit/s ---
+Columns: total, transmit and receive kbit/s, local -> peer, process/pid. TCP only.
+
+I=5
+snap() { ss -tinpH | awk '
+/^[A-Z]/ { k = $4 " " $5; p = "-"
+           if (match($0, /users:\(\("[^"]+",pid=[0-9]+/)) { split(substr($0, RSTART+9, RLENGTH-9), u, "\",pid="); p = u[1] "/" u[2] }
+           next }
+{ tx = rx = 0
+  if (match($0, /bytes_acked:[0-9]+/))    tx = substr($0, RSTART+12, RLENGTH-12)
+  if (match($0, /bytes_received:[0-9]+/)) rx = substr($0, RSTART+15, RLENGTH-15)
+  print k, tx, rx, p }'; }
+BEFORE=$(snap); sleep "$I"; AFTER=$(snap)
+printf "%12s %12s %12s  %-50s %s\n" TOTAL_kbps TX_kbps RX_kbps "LOCAL -> PEER" PROCESS
+{ printf '%s\n' "$BEFORE" | sed 's/^/A /'; printf '%s\n' "$AFTER" | sed 's/^/B /'; } | awk -v i="$I" '
+$1 == "A" { tx[$2" "$3] = $4; rx[$2" "$3] = $5; next }
+{ t = ($4 - tx[$2" "$3]) * 8 / 1000 / i; r = ($5 - rx[$2" "$3]) * 8 / 1000 / i
+  if (t + r > 0) printf "%12.1f %12.1f %12.1f  %-50s %s\n", t + r, t, r, $2 " -> " $3, $6 }' \
+  | sort -rn | head -20
 REFERENCE
 }
 
-while getopts ":sacprf:n:h" opt; do
+while getopts ":sacpbArf:n:i:h" opt; do
     case "$opt" in
         s) MODE=simple ;;
         a) MODE=advanced ;;
         c) MODE=conntrack ;;
         p) MODE=peers ;;
+        b) MODE=bandwidth ;;
+        A) MODE=all ;;
+        i) [[ "$OPTARG" =~ ^[1-9][0-9]*$ ]] || { echo "-i needs a whole number of seconds" >&2; usage 1; }
+           INTERVAL="$OPTARG" ;;
         f) STATE_FILTER="${OPTARG^^}" ;;
         n) [[ "$OPTARG" =~ ^[0-9]+$ ]] || { echo "-n needs a number" >&2; usage 1; }
            TOP="$OPTARG" ;;
@@ -243,4 +323,6 @@ case "$MODE" in
     advanced)  advanced_report ;;
     conntrack) conntrack_report ;;
     peers)     peers_report ;;
+    bandwidth) bandwidth_report ;;
+    all)       all_report ;;
 esac
