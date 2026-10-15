@@ -10,6 +10,7 @@
 # Options:
 #   -f STATE  only show connections in this state, e.g. ESTAB, SYN-SENT, CLOSE-WAIT, TIME-WAIT
 #   -n N      show the top N lines (default 20)
+#   -r        print standalone one-liners you can paste on a server without this script
 #   -h        show this help
 #
 # Processes are shown as name/pid. Run as root so all processes (and conntrack) are visible.
@@ -181,7 +182,47 @@ peers_report() {
     echo "DIR inferred from listening ports. PORT is the service port: local for in, remote for out."
 }
 
-while getopts ":sacpf:n:h" opt; do
+# Standalone one-liners to copy and paste. The quoted heredoc is printed as-is, never run.
+reference() {
+    cat <<'REFERENCE'
+Standalone versions to copy and paste when you can't put this script on a server.
+Run as root to see process names.
+
+--- Simple: rank connections by lifetime retransmits ---
+Columns: retransmits, segments sent, percent, local -> peer, process
+
+ss -tinpH | awk '
+/^[A-Z]/ { conn = $4 " -> " $5 "  " $NF; next }
+match($0, /retrans:[0-9]+\/[0-9]+/) {
+    split(substr($0, RSTART+8, RLENGTH-8), r, "/")
+    out = 0
+    if (match($0, /segs_out:[0-9]+/)) out = substr($0, RSTART+9, RLENGTH-9)
+    printf "%8d %10d %7.2f%%  %s\n", r[2], out, (out ? r[2]*100/out : 0), conn
+}' | sort -rn | head -20
+
+--- Peers: count connections by state, process/pid, initiator -> acceptor:port, direction ---
+Direction is inferred from listening ports. Port is the service port.
+
+{ ss -tlnH | awk '{p=$4; sub(/.*:/,"",p); print "L", p}'; ss -tanpH | sed 's/^/C /'; } | awk '
+function host(a) { sub(/:[^:]*$/, "", a); gsub(/[][]/, "", a); return (a ~ /:/) ? "[" a "]" : a }
+function port(a) { sub(/.*:/, "", a); return a }
+$1=="L" { listen[$2]=1; next }
+$2=="LISTEN" || NF<6 { next }
+{
+  state=$2
+  proc="-"
+  if (match($0, /users:\(\("[^"]+",pid=[0-9]+/)) {
+    split(substr($0, RSTART+9, RLENGTH-9), u, "\",pid=")
+    proc=u[1] "/" u[2]
+  }
+  lip=host($5); lp=port($5); rip=host($6); rp=port($6)
+  if (lp in listen) print state, proc, rip " -> " lip ":" lp, "(in)"
+  else              print state, proc, lip " -> " rip ":" rp, "(out)"
+}' | sort | uniq -c | sort -rn | head -30
+REFERENCE
+}
+
+while getopts ":sacprf:n:h" opt; do
     case "$opt" in
         s) MODE=simple ;;
         a) MODE=advanced ;;
@@ -190,6 +231,7 @@ while getopts ":sacpf:n:h" opt; do
         f) STATE_FILTER="${OPTARG^^}" ;;
         n) [[ "$OPTARG" =~ ^[0-9]+$ ]] || { echo "-n needs a number" >&2; usage 1; }
            TOP="$OPTARG" ;;
+        r) reference; exit 0 ;;
         h) usage 0 ;;
         :) echo "-$OPTARG needs a value" >&2; usage 1 ;;
         *) echo "Unknown option: -$OPTARG" >&2; usage 1 ;;
