@@ -1,21 +1,24 @@
 #!/bin/bash
-# Rank current TCP connections by lifetime retransmits.
+# Rank current TCP connections by lifetime retransmits, or group them by peer.
 #
 # Modes:
 #   -s  simple    retransmits, segments sent, percent, local -> peer, process
 #   -a  advanced  adds direction and TCP state; direction inferred from listening ports (default)
 #   -c  conntrack like advanced, but direction is confirmed from the conntrack table where possible
+#   -p  peers     count connections by state, process, initiator -> acceptor:port and direction
 #
 # Options:
-#   -n N  show the top N connections (default 20)
-#   -h    show this help
+#   -f STATE  only show connections in this state, e.g. ESTAB, SYN-SENT, CLOSE-WAIT, TIME-WAIT
+#   -n N      show the top N lines (default 20)
+#   -h        show this help
 #
-# Run as root so process names (and conntrack) are visible.
+# Processes are shown as name/pid. Run as root so all processes (and conntrack) are visible.
 
 set -o pipefail
 
 TOP=20
 MODE=advanced
+STATE_FILTER=""
 
 usage() {
     sed -n '2,/^$/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
@@ -25,6 +28,11 @@ usage() {
 # Prints "C <line>" for each line of ss -tinpH, for awk to consume.
 ss_connections() {
     ss -tinpH | sed 's/^/C /'
+}
+
+# Prints "C <line>" for each socket line of ss -tanpH (no per-socket TCP info).
+ss_sockets() {
+    ss -tanpH | sed 's/^/C /'
 }
 
 # Prints "L <port>" for each TCP listening port.
@@ -55,9 +63,12 @@ sort_and_trim() {
 
 # Shared awk helpers for parsing ss output.
 AWK_COMMON='
-function proc_name(line,    p) {
+function proc_name(line,    p, u) {
     p = "-"
-    if (match(line, /users:\(\("[^"]+"/)) p = substr(line, RSTART + 9, RLENGTH - 10)
+    if (match(line, /users:\(\("[^"]+",pid=[0-9]+/)) {
+        split(substr(line, RSTART + 9, RLENGTH - 9), u, "\",pid=")
+        p = u[1] "/" u[2]
+    }
     return p
 }
 function retrans_total(line,    r) {
@@ -79,14 +90,17 @@ function ip_of(addr,    a) {
     return a
 }
 function pct(r, o) { return o ? r * 100 / o : 0 }
+function show_host(a) { a = ip_of(a); return (a ~ /:/) ? "[" a "]" : a }
+function wanted(state) { return want == "" || state == want }
 '
 
 simple_report() {
     printf "%8s %10s %9s  %-50s %s\n" RETRANS SEGS_OUT PCT "LOCAL -> PEER" PROCESS
-    ss_connections | awk "$AWK_COMMON"'
+    ss_connections | awk -v want="$STATE_FILTER" "$AWK_COMMON"'
     { sub(/^C /, "") }
-    /^[A-Z]/ { conn = $4 " -> " $5; proc = proc_name($0); next }
+    /^[A-Z]/ { skip = !wanted($1); conn = $4 " -> " $5; proc = proc_name($0); next }
     {
+        if (skip) next
         r = retrans_total($0); if (r < 0) next
         o = segs_out($0)
         printf "%8d %10d %8.2f%%  %-50s %s\n", r, o, pct(r, o), conn, proc
@@ -101,11 +115,12 @@ direction_report() {
         listening_ports
         [ "$use_ct" = 1 ] && conntrack_tuples
         ss_connections
-    } | awk "$AWK_COMMON"'
+    } | awk -v want="$STATE_FILTER" "$AWK_COMMON"'
     $1 == "L" { listen[$2] = 1; next }
     $1 == "T" { ct[$2 "|" $3 "|" $4 "|" $5] = 1; next }
     { sub(/^C /, "") }
     /^[A-Z]/ {
+        skip = !wanted($1)
         state = $1; local = $4; peer = $5; proc = proc_name($0)
         lip = ip_of(local); lp = port_of(local)
         pip = ip_of(peer);  pp = port_of(peer)
@@ -118,6 +133,7 @@ direction_report() {
         next
     }
     {
+        if (skip) next
         r = retrans_total($0); if (r < 0) next
         o = segs_out($0)
         printf "%8d %10d %8.2f%%  %-4s %-10s  %-50s %s\n", r, o, pct(r, o), dir, state, conn, proc
@@ -144,11 +160,34 @@ conntrack_report() {
     echo "DIR: in/out confirmed by conntrack; in?/out? inferred from listening ports (no conntrack entry)."
 }
 
-while getopts ":sacn:h" opt; do
+# Counts connections grouped by state, process, initiator -> acceptor:service port and direction.
+peers_report() {
+    printf "%7s  %-11s %-22s %-4s %s\n" COUNT STATE PROCESS DIR "INITIATOR -> ACCEPTOR:PORT"
+    {
+        listening_ports
+        ss_sockets
+    } | awk -v want="$STATE_FILTER" "$AWK_COMMON"'
+    $1 == "L" { listen[$2] = 1; next }
+    { sub(/^C /, "") }
+    $1 !~ /^[A-Z]/ || $1 == "LISTEN" || NF < 5 || !wanted($1) { next }
+    {
+        lp = port_of($4); rp = port_of($5)
+        if (lp in listen) { dir = "in";  conn = show_host($5) " -> " show_host($4) ":" lp }
+        else              { dir = "out"; conn = show_host($4) " -> " show_host($5) ":" rp }
+        print $1 "\t" proc_name($0) "\t" dir "\t" conn
+    }' | sort | uniq -c | sort -rn | head -n "$TOP" |
+    awk -F'\t' '{ split($1, a, " "); printf "%7d  %-11s %-22s %-4s %s\n", a[1], a[2], $2, $3, $4 }'
+    echo
+    echo "DIR inferred from listening ports. PORT is the service port: local for in, remote for out."
+}
+
+while getopts ":sacpf:n:h" opt; do
     case "$opt" in
         s) MODE=simple ;;
         a) MODE=advanced ;;
         c) MODE=conntrack ;;
+        p) MODE=peers ;;
+        f) STATE_FILTER="${OPTARG^^}" ;;
         n) [[ "$OPTARG" =~ ^[0-9]+$ ]] || { echo "-n needs a number" >&2; usage 1; }
            TOP="$OPTARG" ;;
         h) usage 0 ;;
@@ -161,4 +200,5 @@ case "$MODE" in
     simple)    simple_report ;;
     advanced)  advanced_report ;;
     conntrack) conntrack_report ;;
+    peers)     peers_report ;;
 esac
