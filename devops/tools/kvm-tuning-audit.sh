@@ -5,6 +5,7 @@
 # Usage (as root):  bash kvm-tuning-audit.sh | tee kvm-tuning-report.txt
 
 ID=0; NOK=0; NWARN=0; NFAIL=0; SUGGEST=(); NOTES=()
+RX_RING_TARGET=4096   # preventive RX ring baseline for hypervisor NICs (capped at each NIC's hardware max)
 
 msg() {  # LEVEL TEXT
   ID=$((ID+1)); printf '[%04d] %-4s %s\n' "$ID" "$1" "$2"
@@ -230,30 +231,34 @@ else
     opct=$(droppct "$ovf" "$rxp"); olvl=$(droplvl "$opct")
     [ "$ovf" -eq 0 ] && olvl=OK
     ovtxt="overflow=$ovf of $rxp packets (${opct}%)${ovfnames:+ [$ovfnames]}"
+    # Preventive baseline: a full RX ring drops silently, so hypervisor NICs should sit at the baseline
+    # (RX_RING_TARGET, or the hardware max if lower) even with no overflow yet. Overflow raises the severity.
     ringknown=0; [[ "$rc" =~ ^[0-9]+$ && "$rm" =~ ^[0-9]+$ ]] && ringknown=1
-    case $olvl in
-      OK|INFO)
-        if [ $ringknown -eq 1 ] && [ "$rc" -lt "$rm" ]; then
-          msg INFO "$i RX ring=$rc (max $rm), $ovtxt - headroom available, not needed today"
-        elif [ $ringknown -eq 1 ]; then
-          msg OK "$i RX ring=$rc (max $rm), $ovtxt"
+    overflowing=0; case $olvl in WARN|FAIL) overflowing=1;; esac
+    resetnote="(link resets on most drivers - maintenance window; persist via NetworkManager ethtool.ring-rx or ifupdown post-up)"
+    if [ $ringknown -eq 1 ]; then
+      base=$(( rm < RX_RING_TARGET ? rm : RX_RING_TARGET ))
+      if [ "$rc" -lt "$base" ]; then
+        if [ $overflowing -eq 1 ]; then
+          msg "$olvl" "$i RX ring=$rc (baseline $base, max $rm), $ovtxt - ring overflowing; raise now"
         else
-          msg "$( [ "$olvl" = OK ] && echo OK || echo INFO )" "$i RX ring size not reported by driver ($drvname), $ovtxt"
+          msg WARN "$i RX ring=$rc (baseline $base, max $rm), $ovtxt - below hypervisor baseline; raise preventively (RX overflow drops silently)"
         fi
-        ;;
-      WARN|FAIL)
-        if [ $ringknown -eq 1 ] && [ "$rc" -lt "$rm" ]; then
-          msg "$olvl" "$i RX ring=$rc (max $rm), $ovtxt - ring overflowing; raise it"
-          note "ethtool -G $i rx $rm   (some drivers reset the link when changed; persist via NetworkManager or ifupdown post-up)"
-        elif [ $ringknown -eq 1 ]; then
-          msg "$olvl" "$i RX ring=$rc (already max), $ovtxt - CPUs not draining fast enough; spread RX over more queues/CPUs"
-          note "$i RX overflow at max ring: check queues (ethtool -l $i), IRQ spread (irqbalance, /proc/interrupts) and RPS"
-        else
-          msg "$olvl" "$i RX ring size not reported by driver ($drvname), $ovtxt - NIC dropping on receive"
-          note "$i RX overflow: ring not tunable on $drvname; spread RX over CPUs (RPS: /sys/class/net/$i/queues/rx-*/rps_cpus)"
-        fi
-        ;;
-    esac
+        note "ethtool -G $i rx $base   $resetnote"
+      elif [ $overflowing -eq 1 ]; then
+        msg "$olvl" "$i RX ring=$rc (baseline $base, max $rm), $ovtxt - ring already at baseline; CPUs not draining fast enough"
+        note "$i RX overflow at baseline ring: spread receive first - queues (ethtool -l $i), IRQ spread (irqbalance, /proc/interrupts), RPS$( [ "$rc" -lt "$rm" ] && echo "; if still overflowing, ethtool -G $i rx $rm $resetnote" )"
+      else
+        msg OK "$i RX ring=$rc (baseline $base, max $rm), $ovtxt"
+      fi
+    else
+      if [ $overflowing -eq 1 ]; then
+        msg "$olvl" "$i RX ring size not reported by driver ($drvname), $ovtxt - NIC dropping on receive"
+        note "$i RX overflow: ring not tunable on $drvname; spread RX over CPUs (RPS: /sys/class/net/$i/queues/rx-*/rps_cpus)"
+      else
+        msg "$( [ "$olvl" = OK ] && echo OK || echo INFO )" "$i RX ring size not reported by driver ($drvname), $ovtxt"
+      fi
+    fi
     # TX ring: a full TX ring makes packets wait in the qdisc (backpressure), not drop.
     # So size alone is INFO; WARN only on evidence: qdisc requeues >= 0.1% of packets sent, or tx timeouts in the kernel log.
     read -r tm tcur < <(ethtool -g "$i" 2>/dev/null | awk '/^TX:/{v[++n]=$2} END{print v[1], v[2]}')
