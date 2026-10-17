@@ -11,12 +11,57 @@
 #
 # Options:
 #   -f STATE  only show connections in this state, e.g. ESTAB, SYN-SENT, CLOSE-WAIT, TIME-WAIT
-#   -n N      show the top N lines (default 20)
+#   -n N      show the top N lines (default 20); -n all or -n 0 shows every line
 #   -i SECS   sampling interval for -b (default 5)
-#   -r        print standalone one-liners you can paste on a server without this script
+#   -r        print standalone one-liners and handshake checks you can paste on a server
 #   -h        show this help
 #
 # Processes are shown as name/pid. Run as root so all processes (and conntrack) are visible.
+
+# ---------------------------------------------------------------------------
+# TROUBLESHOOTING NOTES (not shown by -h; -r prints the handshake check below)
+#
+# High retransmit ratio but few connections?
+#   The Grafana ratio RetransSegs / OutSegs gets large on a quiet host, so check the
+#   absolute rates first. Then find out which kind of retransmit is rising:
+#       nstat -n; sleep 60; nstat | grep -Ei 'RetransSegs|OutSegs|SynRetrans|Timeouts|FastRetrans|LossProbe'
+#   TCPSynRetrans   SYN or SYN-ACK resends: handshakes that never complete (see below)
+#   TCPLossProbes   tail loss probes, usually harmless on chatty low-volume connections
+#   TCPTimeouts     full RTO timeouts: connections stalling
+#   TCPFastRetrans  real packet loss on established connections
+#
+# Handshakes that never complete (SYN-SENT / SYN-RECV):
+#       ss -tnop state syn-recv state syn-sent
+#   Example output:
+#       SYN-RECV  0  0  23.227.166.146:8081   85.203.40.180:41000  timer:(on,3.120sec,2)
+#       SYN-SENT  0  1  23.227.166.146:51234  10.20.0.15:5432      users:(("app",pid=812,fd=9)) timer:(on,7.8sec,3)
+#   timer:(on,<time until next resend>,<resends so far>)
+#   SYN-RECV  Inbound. A remote host sent a SYN, we answered with a SYN-ACK, and the
+#             final ACK never came. Many sources hitting one port usually means scanners
+#             or a SYN flood. No process is shown because nothing has accepted it yet.
+#             Each SYN-ACK resend counts in RetransSegs (default limit:
+#             net.ipv4.tcp_synack_retries = 5, about a minute). If the client keeps
+#             resending its SYN, the count can go higher.
+#             This script's -a/-s modes can't show these; ss reports no retrans:
+#             field for half-open entries, only the timer count above.
+#             Fix: firewall the port to trusted sources if it needn't be public, keep
+#             net.ipv4.tcp_syncookies = 1, optionally lower tcp_synack_retries to 2.
+#   SYN-SENT  Outbound. This host is connecting to something that doesn't answer
+#             (down, firewalled with DROP, or a stale address in a config). The process
+#             column shows who is trying. One socket keeps retrying (default
+#             net.ipv4.tcp_syn_retries = 6, up to ~2 minutes), so repeated snapshots show
+#             the same socket. A new local port means a new attempt. These do appear
+#             in -a: ./tcp-retrans-rank.sh -a -f syn-sent -n all
+#   Watch live:   watch -n1 'ss -tnop state syn-recv state syn-sent'
+#   Per source:   see the "SYN-RECV by source" one-liner in -r.
+#
+# Reproduce both states safely on one box (spare port 9999, loopback only):
+#       nc -lk 9999 &
+#       iptables -I INPUT -i lo -p tcp --sport 9999 --tcp-flags SYN,ACK SYN,ACK -j DROP
+#       nc -v -w 60 127.0.0.1 9999
+#       ss -tnop state syn-recv state syn-sent       # both sides, counts climbing
+#       iptables -D INPUT -i lo -p tcp --sport 9999 --tcp-flags SYN,ACK SYN,ACK -j DROP
+# ---------------------------------------------------------------------------
 
 set -o pipefail
 
@@ -62,8 +107,13 @@ conntrack_tuples() {
     }'
 }
 
+# Passes through the first TOP lines, or everything when TOP is 0 (all).
+limit_rows() {
+    if [ "$TOP" -eq 0 ]; then cat; else head -n "$TOP"; fi
+}
+
 sort_and_trim() {
-    sort -rn | head -n "$TOP"
+    sort -rn | limit_rows
 }
 
 # Shared awk helpers for parsing ss output.
@@ -180,7 +230,7 @@ peers_report() {
         if (lp in listen) { dir = "in";  conn = show_host($5) " -> " show_host($4) ":" lp }
         else              { dir = "out"; conn = show_host($4) " -> " show_host($5) ":" rp }
         print $1 "\t" proc_name($0) "\t" dir "\t" conn
-    }' | sort | uniq -c | sort -rn | head -n "$TOP" |
+    }' | sort | uniq -c | sort -rn | limit_rows |
     awk -F'\t' '{ split($1, a, " "); printf "%7d  %-11s %-22s %-4s %s\n", a[1], a[2], $2, $3, $4 }'
     echo
     echo "DIR inferred from listening ports. PORT is the service port: local for in, remote for out."
@@ -295,6 +345,27 @@ $1 == "A" { tx[$2" "$3] = $4; rx[$2" "$3] = $5; next }
 { t = ($4 - tx[$2" "$3]) * 8 / 1000 / i; r = ($5 - rx[$2" "$3]) * 8 / 1000 / i
   if (t + r > 0) printf "%12.1f %12.1f %12.1f  %-50s %s\n", t + r, t, r, $2 " -> " $3, $6 }' \
   | sort -rn | head -20
+
+--- Handshakes: half-open inbound (SYN-RECV) and stuck outbound (SYN-SENT) ---
+timer:(on,<time until next resend>,<resends so far>). SYN-RECV = SYN-ACKs we resent to a
+peer that never finished the handshake. SYN-SENT = our SYNs to a peer that never answered;
+the process column shows who is connecting.
+
+ss -tnop state syn-recv state syn-sent
+
+Watch it live:
+
+watch -n1 'ss -tnop state syn-recv state syn-sent'
+
+--- SYN-RECV by source: half-open connections and SYN-ACK resends per peer and local port ---
+
+printf "%8s %12s  %s\n" HALF_OPEN SYNACK_RETX "PEER -> LOCAL PORT"
+ss -tnoH state syn-recv | awk '
+match($0, /timer:\(on,[^,]*,[0-9]+\)/) {
+  t = substr($0, RSTART, RLENGTH); sub(/.*,/, "", t); sub(/\)/, "", t)
+  ip = $4; sub(/:[^:]*$/, "", ip); lp = $3; sub(/.*:/, "", lp)
+  k = ip " -> :" lp; n[k]++; r[k] += t }
+END { for (k in n) printf "%8d %12d  %s\n", n[k], r[k], k }' | sort -k2 -rn | head -20
 REFERENCE
 }
 
@@ -309,8 +380,9 @@ while getopts ":sacpbArf:n:i:h" opt; do
         i) [[ "$OPTARG" =~ ^[1-9][0-9]*$ ]] || { echo "-i needs a whole number of seconds" >&2; usage 1; }
            INTERVAL="$OPTARG" ;;
         f) STATE_FILTER="${OPTARG^^}" ;;
-        n) [[ "$OPTARG" =~ ^[0-9]+$ ]] || { echo "-n needs a number" >&2; usage 1; }
-           TOP="$OPTARG" ;;
+        n) if [[ "${OPTARG,,}" == all ]]; then TOP=0
+           elif [[ "$OPTARG" =~ ^[0-9]+$ ]]; then TOP="$OPTARG"
+           else echo "-n needs a number or 'all'" >&2; usage 1; fi ;;
         r) reference; exit 0 ;;
         h) usage 0 ;;
         :) echo "-$OPTARG needs a value" >&2; usage 1 ;;
