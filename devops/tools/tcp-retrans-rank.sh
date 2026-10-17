@@ -2,8 +2,9 @@
 # Rank current TCP connections by lifetime retransmits, group them by peer, or measure bandwidth.
 #
 # Modes:
-#   -s  simple    retransmits, segments sent, percent, local -> peer, process
+#   -s  simple    retransmits, segments sent, percent, timer, local -> peer, process
 #   -a  advanced  adds direction and TCP state; direction inferred from listening ports (default)
+#                 -s/-a/-c also list SYN-RECV half-open entries, counting their SYN-ACK resends
 #   -c  conntrack like advanced, but direction is confirmed from the conntrack table where possible
 #   -p  peers     count connections by state, process, initiator -> acceptor:port and direction
 #   -b  bandwidth sample TCP byte counters for a few seconds and rank connections by kbit/s
@@ -17,6 +18,11 @@
 #   -h        show this help
 #
 # Processes are shown as name/pid. Run as root so all processes (and conntrack) are visible.
+# TIMER (-s/-a/-c) is the kernel timer running now, as kind/count:
+#   on/N        data or SYN waiting for an ACK; N = resends since the last ACK (N > 0 = stalled now)
+#   keepalive/N keepalive probes unanswered     persist/N  zero-window probes     -  no timer
+# RETRANS is the socket's lifetime total. For SYN-RECV it is the SYN-ACK resend count
+# from the timer, and SEGS_OUT/PCT show '-' because ss gives no segment count for them.
 
 # ---------------------------------------------------------------------------
 # TROUBLESHOOTING NOTES (not shown by -h; -r prints the handshake check below)
@@ -42,8 +48,8 @@
 #             Each SYN-ACK resend counts in RetransSegs (default limit:
 #             net.ipv4.tcp_synack_retries = 5, about a minute). If the client keeps
 #             resending its SYN, the count can go higher.
-#             This script's -a/-s modes can't show these; ss reports no retrans:
-#             field for half-open entries, only the timer count above.
+#             ss reports no retrans: field for half-open entries, only the timer count
+#             above, so -s/-a/-c take RETRANS for SYN-RECV rows from that timer count.
 #             Fix: firewall the port to trusted sources if it needn't be public, keep
 #             net.ipv4.tcp_syncookies = 1, optionally lower tcp_synack_retries to 2.
 #   SYN-SENT  Outbound. This host is connecting to something that doesn't answer
@@ -75,9 +81,9 @@ usage() {
     exit "${1:-0}"
 }
 
-# Prints "C <line>" for each line of ss -tinpH, for awk to consume.
+# Prints "C <line>" for each line of ss -tinopH (TCP info, timers, processes), for awk.
 ss_connections() {
-    ss -tinpH | sed 's/^/C /'
+    ss -tinopH | sed 's/^/C /'
 }
 
 # Prints "C <line>" for each socket line of ss -tanpH (no per-socket TCP info).
@@ -145,37 +151,72 @@ function ip_of(addr,    a) {
     return a
 }
 function pct(r, o) { return o ? r * 100 / o : 0 }
+# Sets tkind and tcount from a timer:(kind,expiry,count) field; tkind is "" when absent.
+function parse_timer(line,    t, f) {
+    tkind = ""; tcount = 0
+    if (match(line, /timer:\([a-z]+,[^,)]*,[0-9]+\)/)) {
+        t = substr(line, RSTART + 7, RLENGTH - 8)
+        split(t, f, ",")
+        tkind = f[1]; tcount = f[3] + 0
+    }
+}
+function timer_label() { return tkind == "" ? "-" : tkind "/" tcount }
+# Builds the RETRANS/SEGS_OUT/PCT/TIMER columns for the current record.
+# Returns 0 if the record has nothing to report.
+function retrans_cols(state, info,    r, o) {
+    if (state == "SYN-RECV") {
+        if (tkind == "" || tcount <= 0) return 0
+        c_r = tcount; c_o = "-"; c_p = "-"
+    } else {
+        r = retrans_total(info)
+        if (r <= 0 && !(tkind == "on" && tcount > 0)) return 0
+        if (r < 0) r = 0
+        o = segs_out(info)
+        c_r = r; c_o = o; c_p = sprintf("%.2f%%", pct(r, o))
+    }
+    c_t = timer_label()
+    return 1
+}
 function show_host(a) { a = ip_of(a); return (a ~ /:/) ? "[" a "]" : a }
 function wanted(state) { return want == "" || state == want }
 '
 
 simple_report() {
-    printf "%8s %10s %9s  %-50s %s\n" RETRANS SEGS_OUT PCT "LOCAL -> PEER" PROCESS
+    printf "%8s %10s %9s  %-13s %-50s %s\n" RETRANS SEGS_OUT PCT TIMER "LOCAL -> PEER" PROCESS
     ss_connections | awk -v want="$STATE_FILTER" "$AWK_COMMON"'
+    function flush() {
+        if (!have || !wanted(state)) return
+        parse_timer(head)
+        if (retrans_cols(state, info))
+            printf "%8d %10s %9s  %-13s %-50s %s\n", c_r, c_o, c_p, c_t, conn, proc
+    }
     { sub(/^C /, "") }
-    /^[A-Z]/ { skip = !wanted($1); conn = $4 " -> " $5; proc = proc_name($0); next }
-    {
-        if (skip) next
-        r = retrans_total($0); if (r < 0) next
-        o = segs_out($0)
-        printf "%8d %10d %8.2f%%  %-50s %s\n", r, o, pct(r, o), conn, proc
-    }' | sort_and_trim
+    /^[A-Z]/ { flush(); have = 1; head = $0; info = ""
+               state = $1; conn = $4 " -> " $5; proc = proc_name($0); next }
+    { info = info " " $0 }
+    END { flush() }' | sort_and_trim
 }
 
 # Shared by advanced and conntrack modes. Pass "1" to use conntrack.
 direction_report() {
     local use_ct="$1"
-    printf "%8s %10s %9s  %-4s %-10s  %-50s %s\n" RETRANS SEGS_OUT PCT DIR STATE "INITIATOR -> ACCEPTOR" PROCESS
+    printf "%8s %10s %9s  %-13s %-4s %-10s  %-50s %s\n" RETRANS SEGS_OUT PCT TIMER DIR STATE "INITIATOR -> ACCEPTOR" PROCESS
     {
         listening_ports
         [ "$use_ct" = 1 ] && conntrack_tuples
         ss_connections
     } | awk -v want="$STATE_FILTER" "$AWK_COMMON"'
+    function flush() {
+        if (!have || !wanted(state)) return
+        parse_timer(head)
+        if (retrans_cols(state, info))
+            printf "%8d %10s %9s  %-13s %-4s %-10s  %-50s %s\n", c_r, c_o, c_p, c_t, dir, state, conn, proc
+    }
     $1 == "L" { listen[$2] = 1; next }
     $1 == "T" { ct[$2 "|" $3 "|" $4 "|" $5] = 1; next }
     { sub(/^C /, "") }
     /^[A-Z]/ {
-        skip = !wanted($1)
+        flush(); have = 1; head = $0; info = ""
         state = $1; local = $4; peer = $5; proc = proc_name($0)
         lip = ip_of(local); lp = port_of(local)
         pip = ip_of(peer);  pp = port_of(peer)
@@ -187,12 +228,8 @@ direction_report() {
         else             conn = local " -> " peer
         next
     }
-    {
-        if (skip) next
-        r = retrans_total($0); if (r < 0) next
-        o = segs_out($0)
-        printf "%8d %10d %8.2f%%  %-4s %-10s  %-50s %s\n", r, o, pct(r, o), dir, state, conn, proc
-    }' | sort_and_trim
+    { info = info " " $0 }
+    END { flush() }' | sort_and_trim
 }
 
 advanced_report() {
