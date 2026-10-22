@@ -63,12 +63,12 @@ softnet() {  # -> "dropped squeezed" summed over CPUs (hex columns 2 and 3)
   echo "$d $s"
 }
 qdrop() {   # IFACE -> packets dropped by the ROOT qdisc (mq root already sums its children)
-  tc -s qdisc show dev "$1" 2>/dev/null | awk '/^qdisc/{r=($0 ~ / root( |$)/)} r && /dropped/{gsub(/[(),]/,""); for(i=1;i<=NF;i++) if($i=="dropped") s+=$(i+1)} END{printf "%.0f\n", s}'
+  tc -s qdisc show dev "$1" 2>/dev/null | awk '/^qdisc/{r=($0 ~ / root( |$)/)} r && /dropped/{gsub(/[(),]/,""); for(i=1;i<=NF;i++) if($i=="dropped") s+=$(i+1)} END{print s+0}'
 }
 txstat() {  # IFACE -> "name value" for every driver counter with "tx" in its name
   ethtool -S "$1" 2>/dev/null | awk -F: 'NF==2 && tolower($1) ~ /tx/ {gsub(/[ \t]/,"",$1); gsub(/[ \t]/,"",$2); if ($2 ~ /^[0-9]+$/ && tolower($1) !~ /(packets|bytes|pkts)$/) print $1, $2}'
 }
-cpustat() { awk '$1=="cpu"{t=0; for(i=2;i<=9;i++) t+=$i; printf "%.0f %.0f\n", $9, t; exit}' /proc/stat; }   # -> "steal total"
+cpustat() { awk '$1=="cpu"{t=0; for(i=2;i<=9;i++) t+=$i; print $9, t; exit}' /proc/stat; }   # -> "steal total"
 
 [ "$(id -u)" -ne 0 ] && msg WARN "Not running as root - process limits, timer_list and some counters may be missing"
 memkb=$(awk '/MemTotal/{print $2}' /proc/meminfo)
@@ -289,7 +289,7 @@ if isnum "$SAMPLE" && [ "$SAMPLE" -gt 0 ]; then
     dqd=""; has tc && dqd=$(( $(qdrop "$i") - ${A_QD[$i]:-0} ))
     grown=""
     if has ethtool; then
-      grown=$(awk 'NR==FNR{a[$1]=$2; next} ($1 in a) && $2>a[$1]{printf "%s+%.0f ", $1, $2-a[$1]}' \
+      grown=$(awk 'NR==FNR{a[$1]=$2; next} ($1 in a) && $2>a[$1]{printf "%s+%d ", $1, $2-a[$1]}' \
                 <(printf '%s\n' "${A_TXS[$i]}") <(txstat "$i"))
     fi
     if [ "$dtx" -le 0 ] && [ "${dqd:-0}" -le 0 ]; then
