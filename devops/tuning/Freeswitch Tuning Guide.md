@@ -796,6 +796,88 @@ grep -rH 'rmem_max\|netdev_max_backlog' /etc/sysctl.d /run/sysctl.d /usr/lib/sys
 
 Some keys (the `nf_conntrack_*` ones) only exist after the module loads. If they're not applied at boot, add `nf_conntrack` to `/etc/modules-load.d/`.
 
+### The full recommended set
+
+This is the complete file the audit prints when **every** sysctl check fails. It's generated from the script itself (run with every value set below its target), so it matches the script's targets exactly. The `[NNNN]` IDs are dropped because they differ per host, and lines are grouped by guide section.
+
+```ini
+# /etc/sysctl.d/90-freeswitch.conf
+# Full recommended set from freeswitch-tuning-audit.sh.
+# Every value is a MINIMUM (or a maximum, for swappiness and keepalive).
+# Read "Before you apply this" below first.
+
+# --- UDP socket buffers (section 4) ---
+net.core.rmem_max = 16777216              # WARN  ceiling for socket receive buffers
+net.core.wmem_max = 16777216              # WARN  ceiling for socket send buffers
+net.core.rmem_default = 1048576           # WARN  what SIP/RTP sockets get without SO_RCVBUF
+net.core.wmem_default = 524288            # INFO  default send buffer
+net.ipv4.udp_rmem_min = 16384             # INFO  per-socket floor under memory pressure
+net.ipv4.udp_wmem_min = 16384             # INFO  per-socket floor under memory pressure
+
+# --- Packet processing (section 5) ---
+net.core.netdev_max_backlog = 16384       # WARN  per-CPU backlog; overflow = softnet drops
+net.core.netdev_budget = 600              # INFO  packets per softirq run
+net.core.somaxconn = 4096                 # INFO  listen backlog: SIP TCP/TLS, WSS, ESL
+net.ipv4.tcp_max_syn_backlog = 4096       # INFO  half-open TCP during reconnect storms
+net.ipv4.tcp_keepalive_time = 600         # INFO  detect dead SIP TCP/TLS peers behind NAT
+
+# --- Connection tracking (section 7) - only if nf_conntrack is loaded ---
+net.netfilter.nf_conntrack_max = 262144              # WARN  table full = silent drops
+net.netfilter.nf_conntrack_udp_timeout_stream = 120  # INFO  keep RTP flows alive on hold
+
+# --- Memory, threads and file handles (section 8) ---
+vm.swappiness = 10                        # WARN  keep media threads out of swap
+vm.max_map_count = 262144                 # WARN  each thread stack is a mapping
+kernel.threads-max = 32768                # WARN  system-wide thread cap
+kernel.pid_max = 131072                   # INFO  threads use PIDs too
+fs.file-max = 2097152                     # INFO  system-wide open file cap
+fs.nr_open = 1048576                      # INFO  ceiling for any process's open-file limit
+```
+
+That's 19 settings: 9 at WARN level and 10 at INFO level.
+
+The audit never prints a value for `net.ipv4.ip_local_reserved_ports`, because it depends on your RTP range. If your RTP range overlaps the ephemeral range (section 6), add it yourself, for example:
+
+```ini
+net.ipv4.ip_local_reserved_ports = 16384-32768   # your rtp-start-port to rtp-end-port
+```
+
+#### Before you apply this
+
+**The targets are minimums, but a sysctl file sets exact values.** The audit only prints a line when the current value fails its check, so its per-host output is always safe to apply. This full set isn't: on a host where a value is already higher, applying it would **lower** that value. The likely cases:
+
+| Key | Often already higher because |
+|-----|------------------------------|
+| `kernel.pid_max` | systemd distributions set 4194304 |
+| `fs.file-max` | modern kernels set it near the 64-bit maximum |
+| `fs.nr_open` | some distributions raise it to around 1 billion |
+| `kernel.threads-max` | the kernel sizes it from RAM; servers with more than a few GB are usually above 32768 |
+| `net.netfilter.nf_conntrack_max` | sized from RAM, or raised by your firewall tooling |
+| `net.core.somaxconn` | 4096 is the default since kernel 5.4 |
+| `vm.swappiness`, `tcp_keepalive_time` | already set lower by you or a tuned profile |
+
+Check before applying. This prints every line in the file that would make the current setting worse, and every key that doesn't exist yet:
+
+```bash
+F=/etc/sysctl.d/90-freeswitch.conf
+grep -E '^[a-z].*=' "$F" | while IFS='= ' read -r key want; do
+  have=$(sysctl -n "$key" 2>/dev/null) || { echo "MISSING  $key (module not loaded?)"; continue; }
+  case $key in
+    vm.swappiness|net.ipv4.tcp_keepalive_time)
+      [ "$have" -lt "$want" ] && echo "RAISES   $key $have -> $want (current is already better)";;
+    *)
+      [ "$have" -gt "$want" ] && echo "LOWERS   $key $have -> $want (current is already higher)";;
+  esac
+done
+```
+
+Delete or comment out every line it reports, then apply with `sysctl --system`. Re-run the audit afterwards: every check in this file should be OK.
+
+Two more points before using it as a fleet-wide baseline:
+
+* **INFO lines are optional.** On a small PBX, the 9 WARN lines are the ones that matter. The TCP lines only matter if you run SIP over TCP, TLS or WebSockets.
+* **Conntrack lines fail without the module.** If `nf_conntrack` isn't loaded at boot, `sysctl --system` reports those two keys as unknown and skips them. Either load the module first (`/etc/modules-load.d/`) or remove those lines on hosts with no stateful firewall.
+
 ### NIC settings (ethtool, txqueuelen)
 
 `ethtool -G`, `ethtool -L`, `ethtool -N` and `ip link set ... txqueuelen` are lost on reboot or driver reload. Persist them with whatever manages your network.
@@ -903,6 +985,8 @@ If the audit is clean and the live sample shows no drops at peak, the problem is
 ## 16. Quick reference
 
 ### sysctl targets used by the audit
+
+The same values as a ready-to-edit sysctl file, with the checks to run before applying it, are in section 14 under "The full recommended set".
 
 | Key | Target | Level | Section |
 |-----|--------|-------|---------|
