@@ -19,8 +19,8 @@ A "chroot on steroids": capture a running bare-metal Debian machine as a rootfs 
 | Seccomp | Off (`SYSTEMD_SECCOMP=0`). See section 5 for why. |
 | Teardown on stop | **None.** Bridges, tables and sysctls stay in the host kernel until reboot. Guest setup is idempotent. |
 | Kernel versions | **Will drift** between source, guest userspace and host. The host owns all module loading. See section 8. |
-| `/proc/sys`, `/sys` | Writable (`SYSTEMD_NSPAWN_API_VFS_WRITABLE=1`). |
-| Devices | `DevicePolicy=auto`. With `CAP_MKNOD` the guest can create any node it needs. |
+| `/proc/sys`, `/sys` | Writable (`SYSTEMD_NSPAWN_API_VFS_WRITABLE=1`), so the guest sets sysctls. Alternative: host-managed sysctls with read-only `/proc/sys` and `/sys` (section 7.1). |
+| Devices | `DevicePolicy=auto`. With `CAP_MKNOD` the guest can create and open any node it needs (section 9). |
 | PID / mount / cgroup namespaces | Kept. The guest sees only its own processes and its own delegated cgroup subtree. |
 
 **What the guest can do to the host:**
@@ -366,6 +366,36 @@ There's no teardown. Bridges, nft tables and sysctls stay in the host kernel aft
   - Global RT throttling (`kernel.sched_rt_runtime_us=950000`) limits RT tasks to 95% of each CPU. The guest can change it, but the change is host-wide.
   - Priority 89 sits above most kernel threads, so a runaway RR task can starve the host.
 
+### 7.1 Alternative: host-managed sysctls
+
+Sysctls can live in the host's config instead of the guest's. Then the guest no longer needs a writable `/proc/sys` or `/sys`.
+
+**Changes**
+
+1. **Unit file:** drop the writable API VFS line.
+   ```diff
+   - Environment=SYSTEMD_NSPAWN_API_VFS_WRITABLE=1
+   ```
+   `/proc/sys` and `/sys` become read-only in the guest. Nothing else in this design needs them writable: bridges and nftables use netlink, and RT scheduling and rlimits don't touch `/proc/sys`.
+
+2. **Host:** add `/etc/sysctl.d/90-guest.conf` with the settings. The host's `systemd-sysctl` applies it at boot, before `guest.service` starts. It runs after `systemd-modules-load`, so `net.bridge.*` keys work as long as `br_netfilter` is in the host's `modules-load.d`.
+
+3. **Guest:** nothing required. Its `systemd-sysctl.service` has `ConditionPathIsReadWrite=/proc/sys/` and skips itself. Empty the guest's `/etc/sysctl.d/` to avoid confusion.
+
+**Benefits**
+- **The guest's udevd can't start,** because its condition needs `/sys` writable. Keep the mask anyway.
+- **The `kernel.modprobe` loophole (section 8) is closed.**
+- **Sysctls survive image swaps.** A replaced or rolled-back image can't leave stale values behind.
+
+**Watch out for**
+- **Per-interface keys for guest-created interfaces** (e.g. `net.ipv4.conf.gbr0.forwarding`) don't exist at host boot. Either:
+  - use `net.ipv4.conf.default.*` / `all.*` (`default` is copied to each new interface at creation), or
+  - rely on the host's udev: systemd's udev rules re-run `systemd-sysctl` for an interface's prefix when it appears. Because the network namespace is shared, the *host's* udevd sees the guest create `gbr0` and applies per-interface keys from the host's `sysctl.d` at that moment.
+- **Guest software that writes sysctls at runtime fails** with read-only errors. Docker and libvirt, for example, set `ip_forward` themselves. Set those values on the host up front.
+- **Sysctl changes become host config changes** rather than guest image changes. A deployment becomes the image *plus* one host file.
+
+Capabilities and seccomp are unchanged.
+
 ---
 
 ## 8. Kernel modules and kernel version drift
@@ -381,11 +411,38 @@ The host kernel, the source machine's kernel and the guest's userspace **will** 
 - **A newer host kernel under an older guest is generally fine.** The kernel's userspace ABI is backwards compatible.
 - **Sysctls can appear, disappear or be renamed between kernels.** The guest's `systemd-sysctl` logs and skips unknown keys. Check `journalctl -u systemd-sysctl` in the guest after a host kernel upgrade.
 - **After a host kernel upgrade, check `systemctl --failed` in the guest,** and that the bridges and nft tables were recreated. A host kernel upgrade means a host reboot, which also clears all guest-created kernel state, and the guest rebuilds it at start.
-- ⚠️ The guest's writable `/proc/sys` includes `kernel.modprobe`. A guest could repoint it and break the host's autoloading. That's accepted as part of trusting the guest; alternatively, have the host set it after the guest starts.
+- ⚠️ The guest's writable `/proc/sys` includes `kernel.modprobe`. A guest could repoint it and break the host's autoloading. That's accepted as part of trusting the guest. Moving sysctls to the host (section 7.1) closes it, because `/proc/sys` becomes read-only.
 
 ---
 
-## 9. Things not to do
+## 9. Devices
+
+The unit already lets the guest create devices; no further config is needed.
+
+### 9.1 Network devices
+Bridges, veth, tun/tap, vlan, etc. work because of `CAP_NET_ADMIN` (from `--capability=all`) plus the shared network namespace. `ip link add ...` creates real host interfaces. `/dev/net/tun` is already part of nspawn's minimal `/dev`.
+
+### 9.2 Device nodes (`mknod`)
+
+| Setting | Role |
+|---|---|
+| `--capability=all` (includes `CAP_MKNOD`) | Lets the guest *create* the node. |
+| `DevicePolicy=auto` (with no `DeviceAllow=` lines) | Lets the guest *open* it. The cgroup device controller places no restriction. |
+
+If the unit is ever tightened back to `DevicePolicy=closed`, each device needs a `DeviceAllow=` line (e.g. `DeviceAllow=block-sd rw`, `DeviceAllow=/dev/kvm rw`). Without one, nodes can be created but not opened.
+
+### 9.3 Behavior to expect
+- **The guest's `/dev` is a tmpfs,** so hand-made nodes vanish when the guest restarts. Recreate them at each guest boot with `tmpfiles.d` in the guest:
+  ```
+  # /etc/tmpfiles.d/devices.conf  (in the guest)
+  c /dev/kvm 0660 root kvm - 10:232
+  ```
+- **Nothing populates `/dev` automatically,** because udevd is masked in the guest. A disk or USB device hotplugged on the host won't appear in the guest until its node is created. Get the major:minor numbers from the host (`ls -l /dev/sdb`) or from `/sys/class/*/*/dev` in the guest. Reading that still works with host-managed sysctls (section 7.1), where `/sys` is read-only.
+- **Seccomp doesn't affect this.** With a filter on, `mknod` would still be allowed, because the guest has `CAP_MKNOD`.
+
+---
+
+## 10. Things not to do
 
 | Don't | Why |
 |---|---|
@@ -400,7 +457,7 @@ The host kernel, the source machine's kernel and the guest's userspace **will** 
 
 ---
 
-## 10. First run checklist
+## 11. First run checklist
 
 1. Extract the rootfs (section 3) and apply the guest cleanup (section 4).
 2. Check it without booting: `systemd-nspawn -D /var/lib/machines/guest`.
@@ -417,7 +474,7 @@ The host kernel, the source machine's kernel and the guest's userspace **will** 
 
 ---
 
-## 11. Going further: deployable images
+## 12. Going further: deployable images
 
 - **Single-file images:** a raw GPT or squashfs image with `--image=` instead of `--directory=`. That allows atomic swap and rollback: drop in `guest-v2.raw`, repoint the unit, restart. squashfs keeps xattrs but has no ACL support.
 - **Throwaway writes:** `--volatile=overlay` puts a tmpfs overlay over the image, so all changes are lost on stop.
@@ -425,7 +482,7 @@ The host kernel, the source machine's kernel and the guest's userspace **will** 
 
 ---
 
-## 12. Decisions and open questions
+## 13. Decisions and open questions
 
 **Decided**
 - Kernels will drift. The host owns all module loading, and the guest carries no kernel or modules (sections 4, 8).
@@ -435,7 +492,10 @@ The host kernel, the source machine's kernel and the guest's userspace **will** 
 - No teardown on stop; reboot the host for a clean slate (section 6.5).
 - One guest per host.
 
+- The guest can create network devices and device nodes with the current unit (section 9).
+
 **Still open**
+- [ ] Sysctls: guest-managed (current unit) or host-managed (section 7.1)?
 - [ ] Is `br_netfilter` actually needed, or is the nft `bridge` family enough?
 - [ ] How will the guest be accessed: `machinectl shell` from the host only, or sshd on a non-22 port?
 - [ ] How will the host itself be managed (SSH, console, BMC)? The guest's `input` rules must not lock it out.
