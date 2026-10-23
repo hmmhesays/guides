@@ -147,6 +147,49 @@ tar --create --directory=/ \
 
 To see what file capabilities exist on the source: `getcap -r / 2>/dev/null`.
 
+### 3.5 What happens if xattrs or ACLs are missed
+
+**They're silently dropped, with no warning.**
+- **GNU tar (Debian's `tar`):**
+  - creating without `--xattrs`/`--acls` doesn't store them;
+  - extracting without the flags ignores what's in the archive;
+  - extracting without `--xattrs-include='*'` skips `security.*` xattrs, including file capabilities.
+- **What's still preserved:** ordinary mode bits (including setuid and setgid), owner, group and timestamps. These are in the basic tar header.
+- **bsdtar (libarchive) behaves differently:** it stores and restores xattrs and ACLs by default when run as root. The same command line can behave differently depending on which tar is installed.
+
+**Side effects of losing them:**
+
+| Lost | Effect |
+|---|---|
+| File capabilities (`security.capability`) | Binaries using `setcap` instead of setuid (`ping`, `mtr-packet`, …) lose their privileges. Non-root users get "Operation not permitted"; root is unaffected. |
+| Extended ACLs | **Group permissions can become more permissive.** With an extended ACL, the "group" bits in the mode hold the ACL *mask*, not the owning group's permissions. Drop the ACL and those bits become the real group permissions. E.g. `group::r-x` + `user:bob:rwx` shows group `rwx` in `ls -l`, and after the ACL is lost the owning group really gets `rwx`. |
+| Default ACLs on directories | New files get permissions from the umask instead of inheriting. |
+| Other xattrs (journald metadata, user-defined) | No functional effect in this design. |
+
+**Recovering after the fact.** Dump them on the source and reapply on the target:
+```bash
+# source
+getcap -r / 2>/dev/null > caps.txt
+getfacl -R -s -p / 2>/dev/null > acls.txt   # only files with real ACLs
+
+# target: run inside the guest so the paths match
+systemd-nspawn -D $G setfacl --restore=/path/to/acls.txt
+```
+Re-run `setcap` for each line of `caps.txt` (example below).
+
+**Restoring a single capability, e.g. `ping`:**
+```bash
+# inside the guest
+setcap cap_net_raw+ep /usr/bin/ping
+
+# or from the host, without entering the guest
+setcap cap_net_raw+ep /var/lib/machines/guest/usr/bin/ping
+
+# verify — should print: /usr/bin/ping cap_net_raw=ep
+getcap /usr/bin/ping
+```
+Alternatively, `apt reinstall iputils-ping` inside the guest. Its postinst script reapplies the capability.
+
 **Alternative to streaming:** write to a file (`--file=/mnt/backup/guest.tar.zst --zstd`, on another filesystem). Then use `machinectl import-tar guest.tar.zst guest` on the target, which extracts and registers it in one step.
 
 ---
