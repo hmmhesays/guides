@@ -188,7 +188,7 @@ systemctl --root=$G mask \
 | timesyncd / chrony / ntp | With `CAP_SYS_TIME`, the guest would set the host clock. |
 | networking / NetworkManager | The host owns networking. |
 | `systemd-networkd` | Mask it too, **unless** the guest uses it for its bridges (see 6.1). |
-| `nftables.service` | The stock config does `flush ruleset`, which would wipe the host's rules. |
+| `nftables.service` | The stock config does `flush ruleset`, which wipes the *entire* host ruleset. Masking it means the guest's rules are loaded by its own unit (section 6.4) into a named table. **Masking is optional for this deployment:** the host has no firewall, so you can instead leave it enabled and let the guest own the whole ruleset. See section 6.2, Option A. |
 | apt timers | No surprise upgrades of the guest. |
 | smartd, mdadm, lvm, multipath, irqbalance, thermald | Hardware-facing. These fail or contend with the host. |
 | `systemd-modules-load` | It already skips itself without `CAP_SYS_MODULE`; masking makes the intent explicit. |
@@ -304,6 +304,31 @@ The stock template's `ExecStart` hard-codes `--network-veth` and `-U` (private n
   Its `.network` files must match only guest-owned interface names.
 
 ### 6.2 nftables
+
+No unit changes are needed for the guest to maintain its own rules. `CAP_NET_ADMIN` plus the shared network namespace is enough. nft talks to the kernel over netlink, so read-only `/proc/sys`/`/sys` (section 7.1) doesn't affect it. Missing nft expression modules are autoloaded by the host's modprobe.
+
+The choice is *how* the guest loads its rules:
+
+| | Option A: guest owns the whole ruleset | Option B: guest owns a named table |
+|---|---|---|
+| Guest `nftables.service` | **Enabled** (removed from the section 4 mask list) | **Masked** (section 4) |
+| Rules file | Guest's `/etc/nftables.conf`, stock `flush ruleset` at the top | Custom file loaded by `guest-net.service` (section 6.4) |
+| Reload behavior | Replaces everything, so no stale rules after a restart or image swap | `destroy table inet guest` then redefine; only the guest's table changes |
+| Host requirement | Host `nftables.service` disabled and **no** host-side rules at all, since they'd be flushed | Host may keep its own named tables |
+| Fits when | The host runs nothing but nspawn (this deployment) | Host-side rules (e.g. management) may be added later |
+
+**Option B is what the rest of this guide shows.** Option A is simpler for the current decisions. To switch:
+```bash
+systemctl --root=$G unmask nftables.service
+systemctl --root=$G enable nftables.service
+```
+Then drop the `nft -f` line from `guest-net.service`.
+
+**Under either option:**
+- **Forwarding** needs `net.ipv4.ip_forward=1` (and the IPv6 equivalent). Conntrack tunables like `net.netfilter.nf_conntrack_max` likewise. Set them in the guest's `sysctl.d`, or on the host if sysctls are host-managed (section 7.1).
+- **iptables-nft tools in the guest** (Docker, fail2ban) put their tables into the same ruleset. Under Option A, a `flush ruleset` reload removes them until those tools re-add their rules, the same as on bare metal.
+
+**Option B details:**
 - The guest manages **only its own named tables**, e.g. `table inet guest`, and never uses `flush ruleset`.
 - Refresh its tables idempotently. On trixie (nft ≥ 1.0.8):
   ```
@@ -394,7 +419,38 @@ Sysctls can live in the host's config instead of the guest's. Then the guest no 
 - **Guest software that writes sysctls at runtime fails** with read-only errors. Docker and libvirt, for example, set `ip_forward` themselves. Set those values on the host up front.
 - **Sysctl changes become host config changes** rather than guest image changes. A deployment becomes the image *plus* one host file.
 
-Capabilities and seccomp are unchanged.
+Capabilities and seccomp are unchanged. Setting `SYSTEMD_NSPAWN_API_VFS_WRITABLE=0` is the same as removing the line.
+
+**Still works with read-only `/proc/sys` and `/sys`:** RT scheduling (`CPUSchedulingPolicy=`), I/O priority (`IOSchedulingClass=`) and rlimits are syscalls, gated by capabilities rather than these filesystems. The guest's delegated cgroup subtree is still mounted writable, so `CPUWeight=`, `IOWeight=`, `CPUQuota=` etc. work. nftables and `ip link` use netlink and are unaffected.
+
+**Moves to the host:**
+- **RT throttling** (`kernel.sched_rt_runtime_us`) goes in the host's `sysctl.d`.
+- **The block I/O scheduler** must be set by a host udev rule, because the guest can't write `/sys/block/*/queue/scheduler`. `IOSchedulingClass=realtime` only takes effect with BFQ (fully) or mq-deadline (partially); NVMe defaults to `none`, which ignores it.
+  ```
+  # /etc/udev/rules.d/60-iosched.rules  (host)
+  ACTION=="add|change", KERNEL=="sd[a-z]*|nvme[0-9]*n[0-9]*", ATTR{queue/scheduler}="bfq"
+  ```
+  Add `bfq` to the host's `modules-load.d` if it isn't autoloaded.
+
+#### Guest services affected by read-only `/proc/sys` and `/sys` (nothing to do)
+
+These units notice the read-only filesystems, or the missing capability, and skip themselves cleanly, or are already masked. They show as "condition failed" or inactive, not as failed:
+
+| Unit | Why it's harmless |
+|---|---|
+| `systemd-sysctl.service` | `ConditionPathIsReadWrite=/proc/sys/`, so it skips. Sysctls come from the host instead. |
+| `systemd-udevd.service`, `systemd-udev-trigger.service`, `systemd-udev-settle.service` | `ConditionPathIsReadWrite=/sys`, so they skip. They're also masked (section 4). |
+| `systemd-binfmt.service`, `proc-sys-fs-binfmt_misc.automount` | Need writable `/proc/sys`, so they skip. binfmt registration (e.g. qemu-user) would have to be done on the host if ever needed. |
+| `systemd-modules-load.service`, `kmod-static-nodes.service` | Skip because `CAP_SYS_MODULE` is dropped (already the case without 7.1). |
+| `systemd-backlight@`, `systemd-rfkill`, other udev-triggered hardware units | Only started by udev, which doesn't run in the guest. |
+| `apparmor.service` | Detects that it's in a container and doesn't load policy; policy is the host's job. |
+| `sys-kernel-config.mount`, `sys-kernel-debug.mount`, `sys-kernel-tracing.mount`, `sys-fs-fuse-connections.mount` | May be skipped or fail to mount. Nothing in this design uses them. |
+| `nftables.service` | Unaffected (netlink). Masked or enabled per section 6.2. |
+| Package maintainer scripts running `sysctl --system` / `sysctl -w` (e.g. on `procps` upgrades) | Print "Read-only file system" warnings during `apt` runs; harmless. |
+
+**Worth knowing, but not a problem for this design:**
+- **systemd-networkd** (if the guest uses it for bridges) logs warnings when it can't apply per-interface sysctl-backed settings such as `IPForward=`, `IPv6AcceptRA=` or `IPv6LinkLocalAddressGenerationMode=`. Put the equivalent keys in the host's `sysctl.d` (see "per-interface keys" above).
+- **Docker and libvirt** fail to set `ip_forward` themselves. Pre-set it on the host.
 
 ---
 
