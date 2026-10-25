@@ -438,6 +438,8 @@ There's no teardown. Bridges, nft tables and sysctls stay in the host kernel aft
 
 Sysctls can live in the host's config instead of the guest's. Then the guest no longer needs a writable `/proc/sys` or `/sys`.
 
+⚠️ **Not compatible with running Incus in the guest.** Incus writes per-interface sysctls at runtime and fails if `/proc/sys` is read-only (section 10.1).
+
 **Changes**
 
 1. **Unit file:** drop the writable API VFS line.
@@ -541,7 +543,148 @@ If the unit is ever tightened back to `DevicePolicy=closed`, each device needs a
 
 ---
 
-## 10. Things not to do
+## 10. Running Incus inside the guest
+
+Incus works inside this guest, including **unprivileged** Incus containers. It needs a few additions, because Incus/LXC containers are nested one level inside the nspawn guest.
+
+### 10.1 Requirements on the nspawn side
+
+| Need | What to do |
+|---|---|
+| **Writable `/proc/sys`** | Keep `Environment=SYSTEMD_NSPAWN_API_VFS_WRITABLE=1` in `guest.service`. Incus writes per-interface sysctls itself as it creates `incusbr0` (e.g. `/proc/sys/net/ipv6/conf/incusbr0/disable_ipv6`) and treats a failure as fatal. Presetting them on the host can't work, because the bridge doesn't exist yet. **The host-managed sysctl option (section 7.1) is therefore incompatible with Incus.** |
+| Kernel modules | The guest has no `CAP_SYS_MODULE`. Add to the host's `/etc/modules-load.d/guest.conf`: `overlay`, `tun`, `vhost_net`, `vhost_vsock`, plus `br_netfilter` if used and `kvm_intel`/`kvm_amd` for VMs. |
+| Device nodes | Allowed already (`DevicePolicy=auto` + `CAP_MKNOD`). Create them via the guest's tmpfiles.d (section 9.3): `/dev/kvm`, `/dev/vhost-net`, `/dev/vhost-vsock`, `/dev/fuse` (lxcfs). `/dev/net/tun` already exists. |
+| Storage pool | Use the **`dir`** driver, or btrfs/zfs/lvm on a real block device whose node you create in the guest. Avoid loop-backed pools: new `/dev/loopN` nodes are created on the host and don't appear in the guest. |
+| nftables | Incus manages its own tables. Under Option A (section 6.2), a guest `nftables.service` reload with `flush ruleset` wipes them until Incus restarts. Use Option B, or ensure `nftables.service` runs before `incus.service` and is never reloaded independently. |
+| AppArmor | nspawn doesn't expose securityfs, so Incus runs its instances without AppArmor confinement. They work, but are less isolated than on bare metal. |
+| cgroups | Fine. `Delegate=yes` gives the guest a writable cgroup v2 subtree to hand out to instances. |
+| DNS on the bridge | Incus's dnsmasq binds to the `incusbr0` address in the shared namespace. That only conflicts if something on the host already listens on port 53 on that address. |
+
+### 10.2 Unprivileged Incus containers: the kernel's visibility rule
+
+**Symptom:** the instance fails to start, with LXC log lines like
+```
+Failed to mount "proc" onto "/opt/incus/lib/lxc/rootfs/proc"
+Failed to mount "sysfs" on "/opt/incus/lib/lxc/rootfs/sys" with flags 0
+```
+and `VFS: Mount too revealing` in `dmesg`. Privileged instances (`security.privileged=true`) start fine.
+
+**Cause:**
+- An unprivileged instance runs in its own user namespace. From there, the kernel lets it mount a new `proc` or `sysfs` only if a **fully visible** instance of that filesystem already exists in the mount namespace. This is checked by `mount_too_revealing()` / `mnt_already_visible()` in `fs/namespace.c`.
+- **Fully visible** means: mounted from the filesystem's root; with no locked mounts covering anything except empty directories; and the new mount is at least as restrictive in **read-only** and **atime** flags. `nosuid`/`nodev`/`noexec` aren't compared.
+- When LXC creates the instance's user and mount namespaces, every mount copied from the guest becomes **locked** (it can't be unmounted from inside).
+- nspawn mounts over parts of the guest's `/proc` (`/proc/sys`, `/proc/sysrq-trigger`, `/proc/kmsg`, …). Once locked, those overmounts make `/proc` count as not fully visible.
+- The guest's root has no user namespace, so it can mount a fresh procfs freely. One clean copy with nothing on top satisfies the check.
+
+**Fix, part 1: a clean procfs in the guest**
+
+`/etc/systemd/system/unmasked-procfs.service` (inside the guest):
+```ini
+[Unit]
+Description=Unmasked procfs for nested unprivileged containers
+Before=incus.service incus.socket incus-startup.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/mkdir -p /run/unmasked/proc
+ExecStart=/bin/mount -t proc proc /run/unmasked/proc
+ExecStop=-/bin/umount /run/unmasked/proc
+
+[Install]
+WantedBy=multi-user.target
+```
+```bash
+systemctl daemon-reload
+systemctl enable --now unmasked-procfs.service
+findmnt -R /run/unmasked/proc     # must exist and show no child mounts
+```
+- **Don't mount it read-only.** LXC mounts `proc` read-write, which would then be less restrictive than the only visible copy.
+- A clean `sysfs` copy isn't needed. The guest's own `/sys` already passes, because its submounts (cgroup2, debugfs, configfs, tracefs, fusectl) all sit on empty mount-point directories.
+- **Instances don't keep access to it.** LXC mounts `proc` before pivoting into the instance's root, and the guest's tree is dropped afterwards.
+- **Check it after every guest boot.** It has been seen `inactive (dead)` while enabled. Unprivileged autostart instances fail on any boot where it didn't run.
+
+**Fix, part 2: mount `sysfs` read-only in instances (`sys:mixed`)**
+
+LXC's default read-write `sysfs` mount (`flags 0`) is still refused. With `lxc.mount.auto = sys:mixed`, LXC mounts `sysfs` read-only, with only `/sys/devices/virtual/net` writable. A read-only request is at least as restrictive as any existing `sysfs` mount, so it passes. Instances can't write to `/sys` apart from network-device attributes. That's typical for unprivileged containers; workloads that need writable `/sys` must be privileged.
+
+### 10.3 Setting `raw.lxc` (single and multiple lines)
+
+**Single line, for all instances via the default profile:**
+```bash
+incus profile set default raw.lxc "lxc.mount.auto = sys:mixed"
+```
+
+**Multiple lines.** `raw.lxc` is one string, with one LXC key per line. For example, `sys:mixed` plus no network namespace for the instance:
+
+- **Shell, using `$'...'` for the newline:**
+  ```bash
+  incus profile set default raw.lxc $'lxc.mount.auto = sys:mixed\nlxc.net.0.type = none'
+  ```
+- **Shell, using a literal newline inside quotes:**
+  ```bash
+  incus profile set default raw.lxc "lxc.mount.auto = sys:mixed
+  lxc.net.0.type = none"
+  ```
+- **YAML, via `incus profile edit default` (or `incus config edit <instance>`):**
+  ```yaml
+  config:
+    raw.lxc: |-
+      lxc.mount.auto = sys:mixed
+      lxc.net.0.type = none
+  ```
+
+**Per instance instead of the profile:** use `incus config set <instance> raw.lxc ...` with the same values.
+
+**Check and remove:**
+```bash
+incus profile get default raw.lxc
+incus config get <instance> raw.lxc
+incus config show <instance> --expanded | grep -A3 raw.lxc   # effective value
+incus config unset <instance> raw.lxc
+```
+
+⚠️ **An instance's `raw.lxc` replaces the profile's value, rather than merging with it.** If an instance sets its own `raw.lxc`, it must repeat every line it needs from the profile, including `lxc.mount.auto = sys:mixed`.
+
+### 10.4 What `lxc.net.0.type = none` means here
+
+With `none`, the instance gets **no network namespace of its own**. It shares the nspawn guest's network namespace, which is the **host's** namespace in this design. So the instance sees and uses the host's interfaces directly.
+
+- **Remove the NIC device** from wherever `raw.lxc` sets `none` (profile or instance): `incus profile device remove default eth0`. Otherwise Incus also generates its own `lxc.net.0` settings for that NIC.
+- **The instance can't reconfigure host networking.** An unprivileged instance's root has no `CAP_NET_ADMIN` over the host's namespace. Its own network services (systemd-networkd, cloud-init's network stage, resolved) fail or do nothing; disable them in the instance image if the errors are noisy.
+- **Low ports.** Binding ports below 1024 needs `CAP_NET_BIND_SERVICE` over the host's namespace, which unprivileged instances don't have. Use high ports, or lower `net.ipv4.ip_unprivileged_port_start` (a global sysctl, set in the guest or on the host).
+- **Port collisions:** the host, the guest and every `none` instance share one port space.
+- **`incusbr0` isn't needed** for these instances.
+
+### 10.5 Diagnostics for nested-mount failures
+
+```bash
+# Kernel's reason (visibility check vs. other EPERM)
+dmesg -C; incus start <instance>; dmesg | tail -n 5     # "VFS: Mount too revealing"?
+
+# Is the clean proc present? Is the sysfs superblock rw?
+findmnt -R /run/unmasked
+findmnt -o TARGET,VFS-OPTIONS,FS-OPTIONS -t sysfs
+
+# Does incusd share the guest's mount namespace?
+readlink /proc/self/ns/mnt /proc/"$(pgrep -o incusd)"/ns/mnt
+
+# Reproduce an unprivileged mount without Incus
+unshare --user --map-root-user --mount --pid --fork \
+  sh -c 'mkdir -p /tmp/p && mount -t proc proc /tmp/p && echo PROC-OK'
+unshare --user --map-root-user --mount --net --pid --fork \
+  sh -c 'mkdir -p /tmp/t && mount -t sysfs sysfs /tmp/t && echo SYSFS-OK'
+
+# LXC trace log
+incus config set <instance> raw.lxc "lxc.log.level=trace"   # replaces any existing raw.lxc!
+incus start <instance>
+less /var/log/incus/<instance>/lxc.log
+```
+**Fallback:** `incus config set <instance> security.privileged=true` skips the user namespace, so it skips the visibility check. Root in that instance is real root on the host.
+
+---
+
+## 11. Things not to do
 
 | Don't | Why |
 |---|---|
@@ -556,7 +699,7 @@ If the unit is ever tightened back to `DevicePolicy=closed`, each device needs a
 
 ---
 
-## 11. First run checklist
+## 12. First run checklist
 
 1. Extract the rootfs (section 3) and apply the guest cleanup (section 4).
 2. Check it without booting: `systemd-nspawn -D /var/lib/machines/guest`.
@@ -573,7 +716,7 @@ If the unit is ever tightened back to `DevicePolicy=closed`, each device needs a
 
 ---
 
-## 12. Going further: deployable images
+## 13. Going further: deployable images
 
 - **Single-file images:** a raw GPT or squashfs image with `--image=` instead of `--directory=`. That allows atomic swap and rollback: drop in `guest-v2.raw`, repoint the unit, restart. squashfs keeps xattrs but has no ACL support.
 - **Throwaway writes:** `--volatile=overlay` puts a tmpfs overlay over the image, so all changes are lost on stop.
@@ -581,7 +724,7 @@ If the unit is ever tightened back to `DevicePolicy=closed`, each device needs a
 
 ---
 
-## 13. Decisions and open questions
+## 14. Decisions and open questions
 
 **Decided**
 - Kernels will drift. The host owns all module loading, and the guest carries no kernel or modules (sections 4, 8).
@@ -592,9 +735,10 @@ If the unit is ever tightened back to `DevicePolicy=closed`, each device needs a
 - One guest per host.
 
 - The guest can create network devices and device nodes with the current unit (section 9).
+- Incus runs in the guest. Unprivileged Incus containers need the clean-procfs unit plus `lxc.mount.auto = sys:mixed` (section 10.2). `/proc/sys` must stay writable (section 10.1).
 
 **Still open**
-- [ ] Sysctls: guest-managed (current unit) or host-managed (section 7.1)?
+- [ ] Incus instances: `lxc.net.0.type = none` for all instances (profile), or only some (per instance)?
 - [ ] Is `br_netfilter` actually needed, or is the nft `bridge` family enough?
 - [ ] How will the guest be accessed: `machinectl shell` from the host only, or sshd on a non-22 port?
 - [ ] How will the host itself be managed (SSH, console, BMC)? The guest's `input` rules must not lock it out.
