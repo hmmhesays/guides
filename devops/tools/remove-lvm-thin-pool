@@ -1,0 +1,126 @@
+#!/bin/bash
+
+# Exit immediately if a command exits with a non-zero status
+set -e
+
+# Check if running as root
+if [ "$EUID" -ne 0 ]; then
+    echo "Error: Please run this script as root or with sudo."
+    exit 1
+fi
+
+echo "=========================================="
+echo " Proxmox Generic Thin Directory Remover   "
+echo "=========================================="
+echo ""
+
+# 1. Detect and display active Proxmox directory storages
+echo "Active Proxmox Directory Storages:"
+echo "----------------------------------------------------------------------"
+pvesm status --content rootdir,images 2>/dev/null | grep -v "shared" || true
+# Fallback to listing current custom directory mounts
+echo "----------------------------------------------------------------------"
+echo "Hint: Run 'pvesm status' or check your Proxmox Web UI sidebar to find"
+echo "      the exact Storage ID you want to remove."
+echo ""
+
+# 2. Prompt for Proxmox Storage ID
+echo "--- 1. PROXMOX STORAGE ID ---"
+echo "Hint: This is the name displayed in the Proxmox Web UI sidebar."
+read -p "Enter Proxmox Storage ID to remove: " STORAGE_ID
+
+if [ -z "$STORAGE_ID" ]; then
+    echo "Error: Storage ID cannot be empty."
+    exit 1
+fi
+
+# Try to extract the path automatically using pvesm
+MOUNT_POINT=$(pvesm path "$STORAGE_ID" 2>/dev/null || echo "")
+
+# 3. Prompt for Mount Point if not found automatically
+echo ""
+echo "--- 2. HOST MOUNT DIRECTORY ---"
+if [ -n "$MOUNT_POINT" ]; then
+    echo "Hint: Automatically detected mount path: $MOUNT_POINT"
+    read -p "Confirm or change mount directory [Default: $MOUNT_POINT]: " mount_input
+    MOUNT_POINT=${mount_input:-$MOUNT_POINT}
+else
+    echo "Hint: The folder path on the host node (e.g., /mnt/generic-storage)."
+    echo "      You can look at 'cat /etc/fstab' or run 'findmnt' to find it."
+    read -p "Enter host mount directory: " MOUNT_POINT
+fi
+
+if [ -z "$MOUNT_POINT" ]; then
+    echo "Error: Mount point cannot be empty."
+    exit 1
+fi
+
+# 4. Prompt for Volume Group and Logical Volume Name
+echo ""
+echo "--- 3. LVM DETAILS ---"
+echo "Hint: Check 'cat /etc/fstab' to see which /dev/vg_name/lv_name maps here."
+default_vg="pve"
+read -p "Enter Volume Group name [Default: $default_vg]: " vg_input
+VG=${vg_input:-$default_vg}
+
+read -p "Enter Logical Volume name (e.g., lv_generic_storage): " LV
+
+if [ -z "$LV" ]; then
+    echo "Error: Logical Volume name cannot be empty."
+    exit 1
+fi
+
+# Final Warning and Confirmation
+echo ""
+echo "!!! WARNING: THIS WILL PERMANENTLY DELETE ALL DATA ON THIS STORAGE !!!"
+echo "----------------------------------------------------------------------"
+echo "Proxmox Storage ID to Remove:  $STORAGE_ID"
+echo "Host Path to Unmount:          $MOUNT_POINT"
+echo "LVM Volume to Destroy:         /dev/$VG/$LV"
+echo "----------------------------------------------------------------------"
+read -p "Are you absolutely sure you want to completely destroy this storage? (type 'DESTROY'): " confirm
+
+if [ "$confirm" != "DESTROY" ]; then
+    echo "Verification failed. Operation canceled."
+    exit 0
+fi
+
+echo ""
+echo "[1/5] Removing storage definition from Proxmox..."
+if pvesm status | grep -q "^$STORAGE_ID "; then
+    pvesm remove "$STORAGE_ID"
+else
+    echo "Storage ID '$STORAGE_ID' not found in Proxmox configuration. Skipping."
+fi
+
+echo "[2/5] Unmounting the volume safely..."
+if mountpoint -q "$MOUNT_POINT"; then
+    # Use lazy unmount if files are currently open/busy to prevent script lockup
+    umount -l "$MOUNT_POINT"
+fi
+
+echo "[3/5] Cleaning up /etc/fstab entries..."
+if [ -f /etc/fstab ]; then
+    # Remove the exact matching entry line from fstab safely
+    sed -i "\|/dev/$VG/$LV|d" /etc/fstab
+    sed -i "\|$MOUNT_POINT|d" /etc/fstab
+fi
+
+echo "[4/5] Destroying LVM Thin Logical Volume..."
+if [ -b "/dev/$VG/$LV" ]; then
+    lvremove -f "$VG/$LV"
+else
+    echo "Block device /dev/$VG/$LV does not exist. Skipping volume removal."
+fi
+
+echo "[5/5] Cleaning up empty mount point folder..."
+if [ -d "$MOUNT_POINT" ]; then
+    # Only remove if it's empty to be safe
+    rmdir "$MOUNT_POINT" 2>/dev/null || echo "Notice: $MOUNT_POINT contains left-over files, leaving folder in place."
+fi
+
+echo ""
+echo "=========================================="
+echo " Success! Storage '$STORAGE_ID' has been deleted."
+echo " The LVM volume /dev/$VG/$LV has been destroyed."
+echo "=========================================="

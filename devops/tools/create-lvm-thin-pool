@@ -1,0 +1,122 @@
+#!/bin/bash
+
+# Exit immediately if a command exits with a non-zero status
+set -e
+
+# Check if running as root
+if [ "$EUID" -ne 0 ]; then
+    echo "Error: Please run this script as root or with sudo."
+    exit 1
+fi
+
+echo "=========================================="
+echo " Proxmox Generic Thin Directory Creator   "
+echo "=========================================="
+echo ""
+
+# 1. Detect and display existing LVM configurations
+echo "Analyzing system storage..."
+echo "Available Volume Groups (VG) and Thin Pools (LV):"
+echo "----------------------------------------------------------------------"
+lvs -a -o vg_name,lv_name,lv_size,lv_attr | grep -E 'V|t' || echo "No thin pools found automatically."
+echo "----------------------------------------------------------------------"
+echo "Hint: Look at the table above. "
+echo "      The 'VG' column holds your Volume Group name."
+echo "      The 'LV' column holds your Thin Pool name (it will have a 't' in its attributes)."
+echo ""
+
+# 2. Prompt for Volume Group
+default_vg="pve"
+echo "--- 1. VOLUME GROUP ---"
+echo "Hint: Usually 'pve'. You can verify by running 'vgs' in a separate terminal."
+read -p "Enter Volume Group name [Default: $default_vg]: " vg_input
+VG=${vg_input:-$default_vg}
+echo ""
+
+# 3. Prompt for Thin Pool
+default_pool="data"
+echo "--- 2. THIN POOL ---"
+echo "Hint: Usually 'data' on a standard install. Check the table above or run 'lvs'."
+read -p "Enter Thin Pool name [Default: $default_pool]: " pool_input
+POOL=${pool_input:-$default_pool}
+echo ""
+
+# 4. Prompt for New Volume Name
+default_lv="lv_generic_storage"
+echo "--- 3. NEW VOLUME NAME ---"
+echo "Hint: This is the internal system name for this specific partition."
+echo "      Keep it alphanumeric with underscores (e.g., lv_isos, thin_shared)."
+read -p "Enter a name for the new volume [Default: $default_lv]: " lv_input
+LV=${lv_input:-$default_lv}
+echo ""
+
+# 5. Prompt for Virtual Size
+default_size="100G"
+echo "--- 4. VIRTUAL SIZE ---"
+echo "Hint: Since this is a thin pool, you can over-provision. The space is only"
+echo "      allocated as you write data. Use 'G' for Gigabytes or 'T' for Terabytes."
+read -p "Enter virtual size (e.g., 50G, 2T) [Default: $default_size]: " size_input
+SIZE=${size_input:-$default_size}
+echo ""
+
+# 6. Prompt for Mount Point
+default_mount="/mnt/generic-storage"
+echo "--- 5. HOST MOUNT DIRECTORY ---"
+echo "Hint: This is the local folder on your Proxmox host where the data lives."
+echo "      Standard Proxmox mount paths are usually under /mnt/ or /var/lib/vz/."
+read -p "Enter host mount directory [Default: $default_mount]: " mount_input
+MOUNT_POINT=${mount_input:-$default_mount}
+echo ""
+
+# 7. Prompt for Proxmox Storage ID
+default_id="generic-storage"
+echo "--- 6. PROXMOX STORAGE ID ---"
+echo "Hint: This is the display name that will appear in your Proxmox Web UI Sidebar."
+echo "      Use lowercase letters, numbers, or hyphens (no spaces)."
+read -p "Enter Proxmox Storage ID for the GUI [Default: $default_id]: " id_input
+STORAGE_ID=${id_input:-$default_id}
+
+# Final Confirmation
+echo ""
+echo "Summary of actions to perform:"
+echo "------------------------------------------"
+echo "Target Pool:         $VG/$POOL"
+echo "New Volume Name:     $LV"
+echo "Virtual Size:        $SIZE"
+echo "Mount Path:          $MOUNT_POINT"
+echo "Proxmox Storage ID:  $STORAGE_ID"
+echo "------------------------------------------"
+read -p "Proceed with creation? (y/N): " confirm
+
+if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+    echo "Operation canceled."
+    exit 0
+fi
+
+echo ""
+echo "[1/5] Creating thin volume..."
+lvcreate -V "$SIZE" --thinpool "$VG/$POOL" --name "$LV"
+
+echo "[2/5] Formatting volume with ext4..."
+mkfs.ext4 "/dev/$VG/$LV"
+
+echo "[3/5] Setting up persistent mount directory..."
+mkdir -p "$MOUNT_POINT"
+
+# Append to fstab only if it doesn't already exist
+if ! grep -q "/dev/$VG/$LV" /etc/fstab; then
+    echo "/dev/$VG/$LV $MOUNT_POINT ext4 defaults 0 2" >> /etc/fstab
+fi
+
+echo "[4/5] Mounting the volume..."
+mount -a
+
+echo "[5/5] Registering directory storage with Proxmox..."
+pvesm add dir "$STORAGE_ID" --path "$MOUNT_POINT" --content backup,iso,vztmpl
+
+echo ""
+echo "=========================================="
+echo " Success! Storage '$STORAGE_ID' is ready."
+echo " It is mounted at $MOUNT_POINT"
+echo " You can now see it inside your Proxmox UI."
+echo "=========================================="
