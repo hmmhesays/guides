@@ -606,35 +606,44 @@ findmnt -R /run/unmasked/proc     # must exist and show no child mounts
 
 **Fix, part 2: mount `sysfs` read-only in instances (`sys:mixed`)**
 
+*Applies to instances with their own network namespace (bridged NICs). For host networking, see section 10.4. `sys:mixed` doesn't work there.*
+
 LXC's default read-write `sysfs` mount (`flags 0`) is still refused. With `lxc.mount.auto = sys:mixed`, LXC mounts `sysfs` read-only, with only `/sys/devices/virtual/net` writable. A read-only request is at least as restrictive as any existing `sysfs` mount, so it passes. Instances can't write to `/sys` apart from network-device attributes. That's typical for unprivileged containers; workloads that need writable `/sys` must be privileged.
 
 ### 10.3 Setting `raw.lxc` (single and multiple lines)
 
-**Single line, for all instances via the default profile:**
+**Single line: bridged instances, for all instances via the default profile:**
 ```bash
 incus profile set default raw.lxc "lxc.mount.auto = sys:mixed"
 ```
 
-**Multiple lines.** `raw.lxc` is one string, with one LXC key per line. For example, `sys:mixed` plus no network namespace for the instance:
+**Multiple lines.** `raw.lxc` is one string, with one LXC key per line. The example is the host-networking set from section 10.4.
 
-- **Shell, using `$'...'` for the newline:**
+- **Shell, using a heredoc (verified working):**
   ```bash
-  incus profile set default raw.lxc $'lxc.mount.auto = sys:mixed\nlxc.net.0.type = none'
+  incus config set exotic-warthog raw.lxc - <<EOF
+  lxc.net.0.type = none
+  lxc.mount.auto =
+  lxc.mount.auto = proc:rw cgroup:rw:force
+  lxc.mount.entry = /sys sys none rbind,ro,create=dir 0 0
+  EOF
   ```
-- **Shell, using a literal newline inside quotes:**
+  The `-` tells `incus config set` to read the value from stdin. The same works with `incus profile set <profile> raw.lxc -`.
+- **Shell, using `$'...'` for the newlines:**
   ```bash
-  incus profile set default raw.lxc "lxc.mount.auto = sys:mixed
-  lxc.net.0.type = none"
+  incus config set <instance> raw.lxc $'lxc.net.0.type = none\nlxc.mount.auto =\nlxc.mount.auto = proc:rw cgroup:rw:force\nlxc.mount.entry = /sys sys none rbind,ro,create=dir 0 0'
   ```
-- **YAML, via `incus profile edit default` (or `incus config edit <instance>`):**
+- **YAML, via `incus config edit <instance>` (or `incus profile edit <profile>`):**
   ```yaml
   config:
     raw.lxc: |-
-      lxc.mount.auto = sys:mixed
       lxc.net.0.type = none
+      lxc.mount.auto =
+      lxc.mount.auto = proc:rw cgroup:rw:force
+      lxc.mount.entry = /sys sys none rbind,ro,create=dir 0 0
   ```
 
-**Per instance instead of the profile:** use `incus config set <instance> raw.lxc ...` with the same values.
+**Profile or instance:** `incus profile set <profile> raw.lxc ...` applies to every instance using that profile; `incus config set <instance> raw.lxc ...` applies to one.
 
 **Check and remove:**
 ```bash
@@ -646,10 +655,48 @@ incus config unset <instance> raw.lxc
 
 ⚠️ **An instance's `raw.lxc` replaces the profile's value, rather than merging with it.** If an instance sets its own `raw.lxc`, it must repeat every line it needs from the profile, including `lxc.mount.auto = sys:mixed`.
 
-### 10.4 What `lxc.net.0.type = none` means here
+If both bridged and host-networked instances will exist, put the host-networking set in its own profile (e.g. `hostnet`) rather than `default`.
+
+### 10.4 Host networking for unprivileged instances (`lxc.net.0.type = none`)
 
 With `none`, the instance gets **no network namespace of its own**. It shares the nspawn guest's network namespace, which is the **host's** namespace in this design. So the instance sees and uses the host's interfaces directly.
 
+**The working configuration (verified):**
+```
+lxc.net.0.type = none
+lxc.mount.auto =
+lxc.mount.auto = proc:rw cgroup:rw:force
+lxc.mount.entry = /sys sys none rbind,ro,create=dir 0 0
+```
+
+**Symptom without it.** Using `sys:mixed` with `none` fails:
+```
+Failed to mount "sysfs" onto "/opt/incus/lib/lxc/rootfs/proc/sys"
+Failed to mount "sysfs" on "/opt/incus/lib/lxc/rootfs/proc/sys" with flags 14
+```
+This time there's **no** `VFS: Mount too revealing` in `dmesg`. The target path looks odd because of how LXC labels its automatic mount steps; any `sysfs` mount fails the same way.
+
+**Cause: a second kernel rule, separate from the visibility rule.** To mount a new `sysfs`, the caller needs `CAP_SYS_ADMIN` over the **network namespace** it's in, because sysfs shows that namespace's interfaces.
+- **Bridged instances** have their own network namespace, owned by their own user namespace, so container root passes.
+- **With `none`**, the instance is in the host's network namespace, owned by the initial user namespace. Container root (an unprivileged mapped UID) has no capabilities there, so every `sysfs` mount gets `EPERM`. No flag or `sys:` option avoids this.
+
+**What each line does:**
+
+| Line | Purpose |
+|---|---|
+| `lxc.net.0.type = none` | No network namespace; share the guest's (= host's). |
+| `lxc.mount.auto =` | An empty value **clears** the automatic mount list Incus generated. There's no `sys:none` option, so this is the only way to drop the `sys` entry. |
+| `lxc.mount.auto = proc:rw cgroup:rw:force` | Re-adds everything except `sys`. Copy the `proc` and `cgroup` options Incus actually generates: `grep lxc.mount.auto /run/incus/<instance>/lxc.conf`. |
+| `lxc.mount.entry = /sys sys none rbind,ro,create=dir 0 0` | **Bind-mounts** the guest's `/sys` instead. A bind doesn't create a new sysfs instance, so the network-namespace rule doesn't apply. Its contents are correct, because the instance shares that network namespace anyway. |
+
+The clean-procfs unit (section 10.2, part 1) is still required: `proc:rw` is still subject to the visibility rule.
+
+**Inside the instance:**
+- **`/sys` is read-only.** Even without `ro`, container root maps to an unprivileged UID and couldn't write host-owned attributes.
+- **The instance's systemd logs harmless failures** when it tries to mount things under `/sys` (configfs, debugfs, fuse connections). Mask those in the instance image if the noise bothers you.
+- **Check it:** `incus exec <instance> -- ip -br link` should list the host's interfaces.
+
+**Other consequences of `none`:**
 - **Remove the NIC device** from wherever `raw.lxc` sets `none` (profile or instance): `incus profile device remove default eth0`. Otherwise Incus also generates its own `lxc.net.0` settings for that NIC.
 - **The instance can't reconfigure host networking.** An unprivileged instance's root has no `CAP_NET_ADMIN` over the host's namespace. Its own network services (systemd-networkd, cloud-init's network stage, resolved) fail or do nothing; disable them in the instance image if the errors are noisy.
 - **Low ports.** Binding ports below 1024 needs `CAP_NET_BIND_SERVICE` over the host's namespace, which unprivileged instances don't have. Use high ports, or lower `net.ipv4.ip_unprivileged_port_start` (a global sysctl, set in the guest or on the host).
@@ -661,6 +708,11 @@ With `none`, the instance gets **no network namespace of its own**. It shares th
 ```bash
 # Kernel's reason (visibility check vs. other EPERM)
 dmesg -C; incus start <instance>; dmesg | tail -n 5     # "VFS: Mount too revealing"?
+#   present -> visibility rule (section 10.2)
+#   absent, sysfs EPERM, instance uses lxc.net.0.type = none -> network-namespace rule (section 10.4)
+
+# What automatic mounts did Incus generate?
+grep lxc.mount.auto /run/incus/<instance>/lxc.conf
 
 # Is the clean proc present? Is the sysfs superblock rw?
 findmnt -R /run/unmasked
@@ -735,7 +787,7 @@ less /var/log/incus/<instance>/lxc.log
 - One guest per host.
 
 - The guest can create network devices and device nodes with the current unit (section 9).
-- Incus runs in the guest. Unprivileged Incus containers need the clean-procfs unit plus `lxc.mount.auto = sys:mixed` (section 10.2). `/proc/sys` must stay writable (section 10.1).
+- Incus runs in the guest. Unprivileged Incus containers need the clean-procfs unit (section 10.2). Bridged instances also need `lxc.mount.auto = sys:mixed` (section 10.2). Host-networked instances need the `none` + cleared `lxc.mount.auto` + `/sys` bind set (section 10.4). `/proc/sys` must stay writable while Incus manages networks (section 10.1).
 
 **Still open**
 - [ ] Incus instances: `lxc.net.0.type = none` for all instances (profile), or only some (per instance)?
