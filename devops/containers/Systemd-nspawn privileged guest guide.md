@@ -238,6 +238,8 @@ systemctl --root=$G mask \
 
 Masking a unit that doesn't exist in the image is harmless.
 
+**For a fuller, re-runnable version, use the masking script in Addendum A.** It masks everything by default, so comment out whatever your guest uses (e.g. `systemd-sysctl`, `systemd-networkd`, ssh).
+
 **SSH:** the guest shares the host's network namespace, so its sshd would collide with the host's on port 22. Either `systemctl --root=$G mask ssh.service ssh.socket`, or move it to another port and regenerate its host keys. `machinectl shell guest` works without sshd.
 
 **Purge kernel and boot packages:** remove `linux-image-*`, `grub*`, `initramfs-tools` and `firmware-*`. The guest's kernel modules will never match the host's kernel and can't be loaded anyway (section 8). Leaving them in only invites tools to look in the wrong `/lib/modules/` tree.
@@ -812,3 +814,133 @@ less /var/log/incus/<instance>/lxc.log
 - [ ] How will the guest be accessed: `machinectl shell` from the host only, or sshd on a non-22 port?
 - [ ] How will the host itself be managed (SSH, console, BMC)? The guest's `input` rules must not lock it out.
 - [ ] Rollback and versioning: directory + tar, or single-file images?
+
+---
+
+## Addendum A: Masking script (run inside the guest)
+
+A single script that does the section 4 masking and more. Run it inside the guest (`machinectl shell guest`, or `systemd-nspawn -D /var/lib/machines/guest` while the guest is stopped).
+
+```bash
+#!/bin/bash
+
+#Mask Competing services.
+# 1. See what exists
+systemctl list-unit-files 'systemd-udev*' 'systemd-sysctl*' 'systemd-sysext*' \
+  'e2scrub*' 'proc-sys-fs-binfmt_misc*' 'systemd-networkd*' 'systemd-timesyncd*' \
+  'chrony*' 'ntp*' 'networking*' 'NetworkManager*' 'nftables*' 'ssh*' 'apt-daily*' \
+  'unattended-upgrades*' 'smartd*' 'mdmonitor*' 'lvm2-monitor*' 'multipathd*' \
+  'irqbalance*' 'thermald*' 'systemd-modules-load*'
+
+# 2. Confirm the host-affecting ones are NOT running (expect "inactive" for all)
+systemctl is-active nftables.service networking.service NetworkManager.service \
+  systemd-networkd.service ssh.service ssh.socket
+
+# 3. Stop the harmless ones that may be active
+systemctl stop e2scrub_all.timer systemd-sysext.socket apt-daily.timer \
+  apt-daily-upgrade.timer 2>/dev/null
+
+# 4. Mask
+systemctl mask \
+  e2scrub_all.timer e2scrub_all.service e2scrub_reap.service \
+  apparmor.service \
+  systemd-binfmt.service proc-sys-fs-binfmt_misc.automount proc-sys-fs-binfmt_misc.mount \
+  systemd-sysctl.service \
+  systemd-sysext.socket systemd-sysext.service \
+  systemd-modules-load.service \
+  systemd-udevd.service systemd-udevd-control.socket systemd-udevd-kernel.socket \
+  systemd-udev-trigger.service \
+  systemd-timesyncd.service chrony.service ntpsec.service ntp.service \
+  networking.service NetworkManager.service \
+  systemd-networkd.service systemd-networkd.socket systemd-networkd-wait-online.service \
+  nftables.service \
+  ssh.service ssh.socket \
+  apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service \
+  smartd.service mdmonitor.service lvm2-monitor.service multipathd.service \
+  irqbalance.service thermald.service
+
+# 5. Verify
+systemctl list-unit-files --state=masked
+systemctl --failed
+```
+
+**Notes**
+- **Safe to re-run.** Masking a unit that doesn't exist (e.g. udev in a minimal image) only creates a `/dev/null` symlink.
+- **Masking doesn't stop a running unit.** That's why step 2 checks the host-affecting ones are inactive first. If any shows `active`, stop it before masking, and check what it already changed on the host (e.g. `nft list ruleset`).
+- **Units mentioned by other units still appear** as `not-found` or `masked` in `systemctl list-units --all`. That's cosmetic; see Addendum B.
+
+**The script masks everything by default. Comment out the lines for anything your guest uses.** The earlier sections explain each choice. As a reminder of what goes beyond section 4:
+
+| Masked | What masking it means (comment out if you need it) |
+|---|---|
+| `systemd-sysctl.service` | The guest's `/etc/sysctl.d` is **never applied**, even with writable `/proc/sys`. Sysctls belong in the host's `sysctl.d` (section 7.1), or are written at runtime by software such as Incus. |
+| `systemd-networkd*` | The guest can't use networkd for bridges (section 6.1). Use a oneshot unit with `ip link` (section 6.4), or let Incus manage them. |
+| `nftables.service` | Matches section 6.2 **Option B**: the guest's rules load from its own unit, or come from Incus. |
+| `ssh.service`, `ssh.socket` | Access to the guest is only via `machinectl shell guest` from the host. |
+| `apparmor.service` | No AppArmor policy loading in the guest; nspawn doesn't expose securityfs anyway (section 10.1). |
+| `systemd-binfmt`, `binfmt_misc` units | No binfmt registration (e.g. qemu-user) from the guest. |
+| `systemd-sysext*` | The guest won't merge system extensions into its own `/usr`. |
+| `e2scrub*` | No ext4 metadata scrubbing of devices from the guest; that's the host's job. |
+
+---
+
+## Addendum B: Quick reference
+
+### From the host
+
+```bash
+systemctl status guest                  # is the nspawn unit up?
+journalctl -u guest -b                  # nspawn's own output this boot
+machinectl list                         # registered machines
+machinectl status guest                 # state, leader PID, process tree
+machinectl shell guest                  # root shell in the guest
+journalctl -M guest -b                  # the guest's journal from the host
+systemd-cgls -M guest                   # the guest's cgroup / process tree
+```
+
+### Inside the guest: what's running
+
+```bash
+systemctl is-system-running             # "running" = clean; "degraded" = something failed
+systemctl --failed                      # failed units only
+systemctl list-units --type=service --state=running
+systemctl list-sockets                  # socket-activated units (incus.socket etc.)
+systemctl list-timers --all             # anything scheduled
+systemctl list-unit-files --state=masked
+systemctl list-unit-files --state=enabled
+systemctl status <unit>                 # one unit, with its recent log lines
+```
+
+### Inside the guest: boot
+
+```bash
+systemd-analyze                         # total boot time
+systemd-analyze blame                   # slowest units
+systemd-analyze critical-chain          # what boot waited on
+systemd-analyze critical-chain incus.service   # what Incus waited on
+systemd-analyze verify /etc/systemd/system/unmasked-procfs.service   # check a unit file
+systemctl list-jobs                     # boot stuck? shows pending jobs
+journalctl -b                           # everything this boot
+journalctl -b -p warning                # warnings and errors only
+journalctl -b -u <unit>                 # one unit this boot
+journalctl --list-boots                 # previous boots (if the journal is persistent)
+```
+
+### Dependencies and references
+
+```bash
+systemctl list-dependencies <unit>              # what it pulls in
+systemctl list-dependencies --reverse <unit>    # who wants/requires it
+systemctl show -p After,Before,WantedBy <unit>  # ordering at a glance
+grep -rl '<unit>' /usr/lib/systemd/system /etc/systemd/system   # includes After=/Before= references
+```
+
+### Incus-specific checks
+
+```bash
+systemctl status unmasked-procfs        # should be active (exited)
+findmnt -R /run/unmasked/proc           # present, no child mounts
+incus list                              # instances and state
+incus info --show-log <instance>        # LXC log for a failed start
+dmesg | tail                            # "VFS: Mount too revealing" etc. (section 10.5)
+```
