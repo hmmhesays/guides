@@ -578,11 +578,15 @@ and `VFS: Mount too revealing` in `dmesg`. Privileged instances (`security.privi
 
 **Fix, part 1: a clean procfs in the guest**
 
-`/etc/systemd/system/unmasked-procfs.service` (inside the guest):
+`/etc/systemd/system/unmasked-procfs.service` (inside the guest; verified):
 ```ini
 [Unit]
-Description=Unmasked procfs for nested unprivileged containers
-Before=incus.service incus.socket incus-startup.service
+Description=Unmasked proc/sysfs for nested unprivileged containers
+DefaultDependencies=no
+After=local-fs.target
+Before=sockets.target incus.socket incus.service incus-startup.service
+Conflicts=shutdown.target
+Before=shutdown.target
 
 [Service]
 Type=oneshot
@@ -592,17 +596,30 @@ ExecStart=/bin/mount -t proc proc /run/unmasked/proc
 ExecStop=-/bin/umount /run/unmasked/proc
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=sockets.target
 ```
 ```bash
 systemctl daemon-reload
-systemctl enable --now unmasked-procfs.service
+systemctl reenable unmasked-procfs.service   # reenable: drops the old multi-user.target link
+systemctl start unmasked-procfs.service
 findmnt -R /run/unmasked/proc     # must exist and show no child mounts
 ```
+
+**Why this ordering matters.** An earlier version used `WantedBy=multi-user.target` with only `Before=incus.service`. Incus sometimes failed to start instances at boot, because `incus.socket` is set up during `sockets.target`, well before `multi-user.target`. Socket activation (or `incus-startup.service`) could start `incusd` and its autostart instances before the clean procfs existed. This version fixes it:
+
+| Directive | Why |
+|---|---|
+| `WantedBy=sockets.target` | Pulls the unit in at the same early stage where Incus's socket is set up, not later at `multi-user.target`. |
+| `Before=sockets.target incus.socket incus.service incus-startup.service` | Guarantees the mount exists before anything Incus can run, however `incusd` gets started. |
+| `DefaultDependencies=no` | The defaults would add `After=basic.target`. `basic.target` comes *after* `sockets.target`, so with the defaults this ordering would be a cycle. |
+| `After=local-fs.target` | `/run` and the local filesystems are available; it's what the defaults would otherwise have provided. |
+| `Conflicts=` / `Before=shutdown.target` | Replaces the shutdown handling that `DefaultDependencies=no` removes, so the mount is cleanly unmounted at shutdown. |
+
+The description mentions sysfs, but the unit mounts only `proc`; the guest's own `/sys` already passes (below).
 - **Don't mount it read-only.** LXC mounts `proc` read-write, which would then be less restrictive than the only visible copy.
 - A clean `sysfs` copy isn't needed. The guest's own `/sys` already passes, because its submounts (cgroup2, debugfs, configfs, tracefs, fusectl) all sit on empty mount-point directories.
 - **Instances don't keep access to it.** LXC mounts `proc` before pivoting into the instance's root, and the guest's tree is dropped afterwards.
-- **Check it after every guest boot.** It has been seen `inactive (dead)` while enabled. Unprivileged autostart instances fail on any boot where it didn't run.
+- **Verify after a guest reboot:** `systemctl status unmasked-procfs` should show `active (exited)`, and `findmnt /run/unmasked/proc` should show the mount. With the earlier `multi-user.target` version it was sometimes found `inactive (dead)`, and unprivileged autostart instances failed on that boot.
 
 **Fix, part 2: mount `sysfs` read-only in instances (`sys:mixed`)**
 
