@@ -37,12 +37,16 @@ apt list --upgradable 'php*'          # what has a newer version available
 apt-cache search '^php8.2-'           # every 8.2 package the repos offer (find extension names)
 apt-cache depends php8.2              # what a package needs (shows Depends "or" alternatives)
 apt rdepends --installed php8.1-common  # what installed packages depend on it
+dpkg -l 'php8.2*'                     # installed packages: state, version, arch, description
+dpkg -s php8.2-fpm                    # installed package status: version, Depends, conffiles
 dpkg -L php8.2-common                 # files the package installed
 dpkg -S /usr/lib/php/20220829/pdo.so  # which package owns a file
 apt changelog php8.2-fpm              # changelog for the candidate version
 ```
 
 - `apt show -a <package>` shows every available version, not just the candidate.
+- `dpkg -l` state codes: `ii` = installed, `rc` = removed but config files remain (clear with `apt purge`), `un` = not installed. Use `dpkg -l | grep php` for a quick overview.
+- `dpkg -s` reads only the local package database, so it's fast and works offline, but it shows just the installed version. Use `apt show` for repo versions.
 - `dpkg -L` is a quick way to confirm where the module `.ini` sources live (`/usr/share/php8.2-*/`).
 - `dpkg -S` returning "no path found" means the file came from PECL or a manual install, not a package.
 
