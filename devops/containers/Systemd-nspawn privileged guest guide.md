@@ -623,15 +623,22 @@ The description mentions sysfs, but the unit mounts only `proc`; the guest's own
 - **Instances don't keep access to it.** LXC mounts `proc` before pivoting into the instance's root, and the guest's tree is dropped afterwards.
 - **Verify after a guest reboot:** `systemctl status unmasked-procfs` should show `active (exited)`, and `findmnt /run/unmasked/proc` should show the mount. With the earlier `multi-user.target` version it was sometimes found `inactive (dead)`, and unprivileged autostart instances failed on that boot.
 
-**Fix, part 2: mount `sysfs` read-only in instances (`sys:mixed`)**
+**Fix, part 2: mount `sysfs` read-only in instances (`sys:mixed`) — Incus 6 only**
 
 *Applies to instances with their own network namespace (bridged NICs). For host networking, see section 10.4. `sys:mixed` doesn't work there.*
+
+| Incus version | `sys:mixed` needed? |
+|---|---|
+| **6.x** | **Yes.** Without it, instances fail with `Failed to mount "sysfs" ... with flags 0`. |
+| **7.x** | **No** (verified). Unprivileged instances with their own network namespace start without it. |
+
+Incus 7 still generates `lxc.mount.auto = proc:rw sys:rw cgroup:rw:force`, so the difference isn't in Incus's generated config. It's in how the bundled LXC handles the refused read-write `sysfs` mount. The exact mechanism isn't confirmed. Because each image pins an exact Incus version, check this again whenever the Incus version in the image changes. The clean-procfs unit (part 1) is **still required on Incus 7**.
 
 LXC's default read-write `sysfs` mount (`flags 0`) is still refused. With `lxc.mount.auto = sys:mixed`, LXC mounts `sysfs` read-only, with only `/sys/devices/virtual/net` writable. A read-only request is at least as restrictive as any existing `sysfs` mount, so it passes. Instances can't write to `/sys` apart from network-device attributes. That's typical for unprivileged containers; workloads that need writable `/sys` must be privileged.
 
 ### 10.3 Setting `raw.lxc` (single and multiple lines)
 
-**Single line: bridged instances, for all instances via the default profile:**
+**Single line: bridged instances on Incus 6, for all instances via the default profile** (not needed on Incus 7, section 10.2):
 ```bash
 incus profile set default raw.lxc "lxc.mount.auto = sys:mixed"
 ```
@@ -706,9 +713,19 @@ This time there's **no** `VFS: Mount too revealing` in `dmesg`. The target path 
 | `lxc.net.0.type = none` | No network namespace; share the guest's (= host's). |
 | `lxc.mount.auto =` | An empty value **clears** the automatic mount list Incus generated. There's no `sys:none` option, so this is the only way to drop the `sys` entry. |
 | `lxc.mount.auto = proc:rw cgroup:rw:force` | Re-adds everything except `sys`. Copy the `proc` and `cgroup` options Incus actually generates: `grep lxc.mount.auto /run/incus/<instance>/lxc.conf`. |
+| *(optional)* `lxc.mount.auto = shmounts:/var/lib/incus/shmounts/<instance>:/dev/.incus-mounts` | See "The cleared list also drops `shmounts`" below. |
 | `lxc.mount.entry = /sys sys none rbind,ro,create=dir 0 0` | **Bind-mounts** the guest's `/sys` instead. A bind doesn't create a new sysfs instance, so the network-namespace rule doesn't apply. Its contents are correct, because the instance shares that network namespace anyway. |
 
-The clean-procfs unit (section 10.2, part 1) is still required: `proc:rw` is still subject to the visibility rule.
+The clean-procfs unit (section 10.2, part 1) is still required: `proc:rw` is still subject to the visibility rule. Verified still required on both Incus 6 and Incus 7, as is this whole set. The network-namespace rule is in the kernel, so no Incus version can lift it.
+
+**The cleared list also drops `shmounts`.** Incus generates two `lxc.mount.auto` lines, e.g. on Incus 7:
+```
+lxc.mount.auto = proc:rw sys:rw cgroup:rw:force
+lxc.mount.auto = shmounts:/var/lib/incus/shmounts/<instance>:/dev/.incus-mounts
+```
+`raw.lxc` is appended after both, so the empty `lxc.mount.auto =` clears **both**. `shmounts` is the shared directory Incus uses to inject mounts into a *running* instance.
+- **Without it:** instances start and run normally. Disk devices added while the instance is running (`incus config device add <instance> ... disk ...`) may not appear until the next restart. Devices added while it's stopped are unaffected.
+- **To keep live disk hotplug,** re-add the line in the instance's `raw.lxc`, copied from its generated `lxc.conf`. The path contains the instance name, so this line can't go in a shared profile; set it per instance.
 
 **Inside the instance:**
 - **`/sys` is read-only.** Even without `ro`, container root maps to an unprivileged UID and couldn't write host-owned attributes.
@@ -806,7 +823,7 @@ less /var/log/incus/<instance>/lxc.log
 - One guest per host.
 
 - The guest can create network devices and device nodes with the current unit (section 9).
-- Incus runs in the guest. Unprivileged Incus containers need the clean-procfs unit (section 10.2). Bridged instances also need `lxc.mount.auto = sys:mixed` (section 10.2). Host-networked instances need the `none` + cleared `lxc.mount.auto` + `/sys` bind set (section 10.4). `/proc/sys` must stay writable while Incus manages networks (section 10.1).
+- Incus runs in the guest. Unprivileged Incus containers need the clean-procfs unit (section 10.2). On Incus 6, bridged instances also need `lxc.mount.auto = sys:mixed`; Incus 7 doesn't (section 10.2). Host-networked instances need the `none` + cleared `lxc.mount.auto` + `/sys` bind set (section 10.4). `/proc/sys` must stay writable while Incus manages networks (section 10.1).
 
 **Still open**
 - [ ] Incus instances: `lxc.net.0.type = none` for all instances (profile), or only some (per instance)?
