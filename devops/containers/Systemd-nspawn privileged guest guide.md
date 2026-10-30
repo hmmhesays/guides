@@ -286,6 +286,9 @@ ExecStart=/usr/bin/systemd-nspawn \
     --drop-capability=CAP_SYS_MODULE \
     --resolv-conf=copy-host \
     --link-journal=no
+# Optional (section 10.6): run the guest under a permissive AppArmor profile so the
+# host's path-based profiles don't attach to guest/instance processes.
+#AppArmorProfile=nspawn-guest
 # No --network-* / --private-network flags: the guest shares the host netns.
 # For a single-file image use --image=/var/lib/machines/guest.raw instead of --directory.
 
@@ -558,7 +561,7 @@ Incus works inside this guest, including **unprivileged** Incus containers. It n
 | Device nodes | Allowed already (`DevicePolicy=auto` + `CAP_MKNOD`). Create them via the guest's tmpfiles.d (section 9.3): `/dev/kvm`, `/dev/vhost-net`, `/dev/vhost-vsock`, `/dev/fuse` (lxcfs). `/dev/net/tun` already exists. |
 | Storage pool | Use the **`dir`** driver, or btrfs/zfs/lvm on a real block device whose node you create in the guest. Avoid loop-backed pools: new `/dev/loopN` nodes are created on the host and don't appear in the guest. |
 | nftables | Incus manages its own tables. Under Option A (section 6.2), a guest `nftables.service` reload with `flush ruleset` wipes them until Incus restarts. Use Option B, or ensure `nftables.service` runs before `incus.service` and is never reloaded independently. |
-| AppArmor | nspawn doesn't expose securityfs, so Incus runs its instances without AppArmor confinement. They work, but are less isolated than on bare metal. |
+| AppArmor | nspawn doesn't expose securityfs, so Incus runs its instances without AppArmor confinement (warning: `AppArmor support has been disabled`). They work, but are less isolated than on bare metal, and the **host's** profiles can attach to their binaries by path. See section 10.6. |
 | cgroups | Fine. `Delegate=yes` gives the guest a writable cgroup v2 subtree to hand out to instances. |
 | DNS on the bridge | Incus's dnsmasq binds to the `incusbr0` address in the shared namespace. That only conflicts if something on the host already listens on port 53 on that address. |
 
@@ -770,6 +773,112 @@ less /var/log/incus/<instance>/lxc.log
 ```
 **Fallback:** `incus config set <instance> security.privileged=true` skips the user namespace, so it skips the visibility check. Root in that instance is real root on the host.
 
+### 10.6 AppArmor: why the guest has none, and host profiles leaking in
+
+#### Why there's no AppArmor inside the guest
+Userspace controls AppArmor through two interfaces:
+- **securityfs, at `/sys/kernel/security/apparmor/`:** loading, replacing and listing profiles, and policy namespaces. `apparmor_parser` writes here.
+- **`/proc/<pid>/attr/apparmor/`:** which profile a process is in.
+
+**nspawn doesn't mount securityfs in the guest, deliberately.** There's one AppArmor policy for the whole kernel, and nspawn can't give a guest its own policy namespace (LXC/Incus can, on bare metal). Exposing securityfs would let the guest load, replace or remove profiles that confine the **host**.
+
+The guest's tools detect this and skip AppArmor:
+- **Debian's `apparmor.service`** only loads policy in a container that has its own policy namespace, so here it skips. It's also masked by Addendum A.
+- **Incus** finds no `/sys/kernel/security/apparmor`, logs the warning `AppArmor support has been disabled`, and starts instances unconfined.
+
+The guest could probably mount securityfs itself, since it has `CAP_SYS_ADMIN` + `CAP_MAC_ADMIN` and no user namespace. Incus would then write its profiles straight into the **host's global policy**. That's untested and goes against keeping the host unaffected, so it isn't recommended.
+
+#### Namespaces don't isolate AppArmor
+Namespaces control what a process can *see* (PIDs, interfaces, mounts, UIDs). AppArmor is a kernel-wide check (an LSM) on every exec, file open and socket call, whatever namespace the caller is in. So guest and instance processes are still checked against the **host's** loaded policy.
+
+**Host profiles attach by path to unconfined processes.** A process with no profile that execs a binary matching a loaded profile's path (e.g. `/{,usr/}sbin/dhclient`) is moved into that profile. The path is resolved within the process's own mount namespace, so a guest's or instance's `/sbin/dhclient` matches as well.
+
+On a normal Incus or Proxmox host, container processes are confined by the container's own profile, so host profiles never attach. Here, the guest and its instances run **unconfined**, and host profiles attach to them by path.
+
+#### Example: the host's `dhclient` profile confining an Incus instance
+Seen on a Proxmox host (AppArmor enforcing) with a RHEL-family Incus instance:
+```
+apparmor="DENIED" operation="create" class="net" ... profile="/{,usr/}sbin/dhclient" comm="dhclient" family="unix" ...
+apparmor="DENIED" operation="mknod" ... name="/var/lib/dhclient/dhclient--eth0.lease" ... fsuid=1000000
+```
+- **`fsuid=1000000`** means the process is in an unprivileged Incus instance (its root is mapped to host UID 1000000). The guest itself has no user namespace, so its processes show `fsuid=0`. The audit `pid=` is always the host PID.
+- **The layers:**
+  ```
+  host (AppArmor enforcing, owns the dhclient profile)
+  └─ nspawn guest (unconfined, uid 0, shares host netns)
+     └─ Incus unprivileged instance (unconfined, uid 0 → 1000000, own netns)
+        └─ dhclient  ← confined by the host's /sbin/dhclient profile
+  ```
+- **Impact: log noise, not a failure.** Only unix sockets (syslog), an OpenSSL config read and the lease file are denied. The raw/inet sockets used for DHCP itself are allowed, so the instance gets its address. Without the lease file it does a fresh DHCP exchange after each restart, and Incus's dnsmasq gives it the same address anyway.
+- **To find which layer a process is in:** `cat /proc/<pid>/cgroup` on the host. A path through `guest.service` and `lxc.payload.<instance>` means an instance.
+
+Any binary in the guest or an instance whose path matches a host profile is affected the same way, e.g. `dhclient`, `tcpdump`, `ntpd`, `chronyd`, `man`. To find them: `journalctl -k | grep 'apparmor="DENIED"'`.
+
+#### Options
+
+| Option | Host change? | Notes |
+|---|---|---|
+| Leave it | No | Fine when the denials are harmless, as with `dhclient`. |
+| Change the instance image to avoid the path (e.g. systemd-networkd's or NetworkManager's built-in DHCP instead of `dhclient`) | No | Fixes one binary at a time. |
+| `aa-complain` or disable the single host profile | Yes | Complain mode still logs, as `ALLOWED`. |
+| **Run the guest under a permissive profile** (below) | Yes, small | Stops *all* host profiles attaching to the guest and its instances. |
+| Disable AppArmor on the host entirely | Yes, large | Needs `apparmor=0` on the kernel command line. **Not while the host is Proxmox**, whose own LXC containers rely on AppArmor. Reasonable on a dedicated "only nspawn" host. |
+
+#### The permissive `nspawn-guest` profile
+A process under a profile that **allows everything** is technically confined, so host profiles no longer attach to it by path. Programs it runs inherit the profile. There's no security gained or lost; it only stops the accidental path matches. It's the closest equivalent to what Incus does on bare metal.
+
+`/etc/apparmor.d/nspawn-guest` (on the **host**; requires AppArmor ≥ 4.0 for `all,`, verified available on 4.1.1):
+```
+abi <abi/4.0>,
+include <tunables/global>
+
+profile nspawn-guest flags=(attach_disconnected,mediate_deleted) {
+  all,
+}
+```
+
+| Part | Why |
+|---|---|
+| `all,` | Allows every rule type: file (including exec that stays in this profile), capability, network, unix, mount, signal, ptrace, dbus, userns, … |
+| `attach_disconnected` | Required for processes in other mount namespaces, whose paths don't connect back to the host's root. `all,` covers permissions, not flags. |
+| `mediate_deleted` | Lets processes keep using files that have since been deleted (logs, temporary files). |
+| `abi <abi/4.0>` | Correct for 4.1.x; there's no separate 4.1 ABI file. |
+
+On AppArmor 3.x, which has no `all,`, list the rules inside the profile instead:
+```
+  file,
+  capability,
+  network,
+  unix,
+  signal,
+  ptrace,
+  dbus,
+  mount,
+  umount,
+  remount,
+  pivot_root,
+  change_profile -> **,
+```
+
+⚠️ **Don't use `flags=(unconfined)` instead.** A profile with that flag behaves like unconfined, and host profiles would likely still attach by path.
+
+**Applying it:**
+1. Load the profile on the host: `apparmor_parser -r /etc/apparmor.d/nspawn-guest`. This is only needed when adding or changing it. At every boot `apparmor.service` loads everything in `/etc/apparmor.d/` (except `disable/`), well before `guest.service`.
+2. In `guest.service` `[Service]`: `AppArmorProfile=nspawn-guest`. Optionally also add `After=apparmor.service` to `[Unit]`, though the default ordering already handles it.
+3. Restart the guest.
+
+**Verify:**
+```bash
+aa-status | grep nspawn-guest
+systemctl status guest
+cat /proc/$(machinectl show guest -p Leader --value)/attr/current   # nspawn-guest (enforce)
+journalctl -k -f | grep 'apparmor="DENIED"'                          # host-profile denials should stop
+```
+
+**Failure mode:** if the profile file has a syntax error, `apparmor.service` skips it at boot. `guest.service` then fails to start, because `AppArmorProfile=` names a profile that isn't loaded. Any denial that names `nspawn-guest` shows what to add. With `all,` there shouldn't be any.
+
+**Status:** untested in this setup. The profile is a host change, so it's an exception to "host untouched".
+
 ---
 
 ## 11. Things not to do
@@ -831,6 +940,7 @@ less /var/log/incus/<instance>/lxc.log
 - [ ] How will the guest be accessed: `machinectl shell` from the host only, or sshd on a non-22 port?
 - [ ] How will the host itself be managed (SSH, console, BMC)? The guest's `input` rules must not lock it out.
 - [ ] Rollback and versioning: directory + tar, or single-file images?
+- [ ] AppArmor: adopt the permissive `nspawn-guest` profile (section 10.6), handle collisions one at a time, or disable AppArmor once the host is a dedicated nspawn host rather than Proxmox?
 
 ---
 
