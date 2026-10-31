@@ -686,6 +686,8 @@ incus config unset <instance> raw.lxc
 
 If both bridged and host-networked instances will exist, put the host-networking set in its own profile (e.g. `hostnet`) rather than `default`.
 
+If the guest runs under the `nspawn-guest` AppArmor profile, every `raw.lxc` also needs `lxc.apparmor.profile = unchanged` (section 10.6).
+
 ### 10.4 Host networking for unprivileged instances (`lxc.net.0.type = none`)
 
 With `none`, the instance gets **no network namespace of its own**. It shares the nspawn guest's network namespace, which is the **host's** namespace in this design. So the instance sees and uses the host's interfaces directly.
@@ -877,7 +879,13 @@ journalctl -k -f | grep 'apparmor="DENIED"'                          # host-prof
 
 **Failure mode:** if the profile file has a syntax error, `apparmor.service` skips it at boot. `guest.service` then fails to start, because `AppArmorProfile=` names a profile that isn't loaded. Any denial that names `nspawn-guest` shows what to add. With `all,` there shouldn't be any.
 
-**Status:** untested in this setup. The profile is a host change, so it's an exception to "host untouched".
+**Required with Incus: add `lxc.apparmor.profile = unchanged` to `raw.lxc`.** Incus generates `lxc.apparmor.profile = unconfined`, and LXC can't switch to that from inside `nspawn-guest`. The instance fails to start and `incus.service` hangs, which keeps the guest unit stuck in `activating`. With `unchanged`, instances inherit `nspawn-guest`:
+```
+lxc.apparmor.profile = unchanged
+```
+Add it to every profile, and to every instance that sets its own `raw.lxc` (an instance's value replaces the profile's), alongside its existing lines. Check with `grep -i apparmor /run/incus/<instance>/lxc.conf`: `unchanged` must be the last line.
+
+**Status:** verified working with Incus 7. The profile is a host change, so it's an exception to "host untouched".
 
 ---
 
