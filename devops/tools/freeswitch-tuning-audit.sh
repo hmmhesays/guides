@@ -63,12 +63,21 @@ softnet() {  # -> "dropped squeezed" summed over CPUs (hex columns 2 and 3)
   echo "$d $s"
 }
 qdrop() {   # IFACE -> packets dropped by the ROOT qdisc (mq root already sums its children)
-  tc -s qdisc show dev "$1" 2>/dev/null | awk '/^qdisc/{r=($0 ~ / root( |$)/)} r && /dropped/{gsub(/[(),]/,""); for(i=1;i<=NF;i++) if($i=="dropped") s+=$(i+1)} END{print s+0}'
+  local v s=0
+  for v in $(tc -s qdisc show dev "$1" 2>/dev/null | awk '/^qdisc/{r=($0 ~ / root( |$)/)} r && /dropped/{gsub(/[(),]/,""); for(i=1;i<=NF;i++) if($i=="dropped") print $(i+1)}'); do
+    isnum "$v" && s=$((s + v))
+  done
+  echo "$s"
 }
 txstat() {  # IFACE -> "name value" for every driver counter with "tx" in its name
   ethtool -S "$1" 2>/dev/null | awk -F: 'NF==2 && tolower($1) ~ /tx/ {gsub(/[ \t]/,"",$1); gsub(/[ \t]/,"",$2); if ($2 ~ /^[0-9]+$/ && tolower($1) !~ /(packets|bytes|pkts)$/) print $1, $2}'
 }
-cpustat() { awk '$1=="cpu"{t=0; for(i=2;i<=9;i++) t+=$i; print $9, t; exit}' /proc/stat; }   # -> "steal total"
+cpustat() {  # -> "steal total" (user..steal jiffies), summed in bash so large values stay integers
+  local cpu f t=0
+  read -r cpu f[1] f[2] f[3] f[4] f[5] f[6] f[7] f[8] _ < /proc/stat
+  for i in 1 2 3 4 5 6 7 8; do t=$((t + ${f[$i]:-0})); done
+  echo "${f[8]:-0} $t"
+}
 
 [ "$(id -u)" -ne 0 ] && msg WARN "Not running as root - process limits, timer_list and some counters may be missing"
 memkb=$(awk '/MemTotal/{print $2}' /proc/meminfo)
@@ -289,8 +298,11 @@ if isnum "$SAMPLE" && [ "$SAMPLE" -gt 0 ]; then
     dqd=""; has tc && dqd=$(( $(qdrop "$i") - ${A_QD[$i]:-0} ))
     grown=""
     if has ethtool; then
-      grown=$(awk 'NR==FNR{a[$1]=$2; next} ($1 in a) && $2>a[$1]{printf "%s+%d ", $1, $2-a[$1]}' \
-                <(printf '%s\n' "${A_TXS[$i]}") <(txstat "$i"))
+      declare -A before=(); while read -r k v; do [ -n "$k" ] && before[$k]=$v; done <<<"${A_TXS[$i]}"
+      while read -r k v; do
+        [ -n "$k" ] && isnum "$v" && isnum "${before[$k]}" && [ "$v" -gt "${before[$k]}" ] && grown+="$k+$((v - ${before[$k]})) "
+      done < <(txstat "$i")
+      unset before
     fi
     if [ "$dtx" -le 0 ] && [ "${dqd:-0}" -le 0 ]; then
       msg OK "$i: no new TX drops (interface or qdisc)${grown:+  - driver TX counters that moved: $grown}"
