@@ -72,6 +72,16 @@ qdrop() {   # IFACE -> packets dropped by the ROOT qdisc (mq root already sums i
 txstat() {  # IFACE -> "name value" for every driver counter with "tx" in its name
   ethtool -S "$1" 2>/dev/null | awk -F: 'NF==2 && tolower($1) ~ /tx/ {gsub(/[ \t]/,"",$1); gsub(/[ \t]/,"",$2); if ($2 ~ /^[0-9]+$/ && tolower($1) !~ /(packets|bytes|pkts)$/) print $1, $2}'
 }
+rxstat() {  # IFACE -> "name value" for driver RX loss counters (names vary by driver; XDP drops excluded as intentional)
+  ethtool -S "$1" 2>/dev/null | awk -F: 'NF==2 {n=$1; v=$2; gsub(/[ \t]/,"",n); gsub(/[ \t]/,"",v); l=tolower(n)
+    if (v ~ /^[0-9]+$/ && l ~ /rx/ && l ~ /(drop|discard|miss|no_?buf|out_of_buf|no_dma|no_desc|fifo|overrun)/ && l !~ /xdp/ &&
+        l != "rx_dropped" && l != "rx_missed_errors" && l != "rx_fifo_errors") print n, v}'
+}
+rxport() { [[ ${1,,} =~ (_phy$|_phy_|^phy_|^mac_) ]]; }   # counter NAME is NIC/PHY-level (e.g. mlx5 rx_discards_phy), not the host ring
+rxqpkts() {  # IFACE -> "name value" for per-queue RX packet counters (ixgbe rx_queue_0_packets, i40e rx-0.packets, mlx5 rx0_packets, ...)
+  ethtool -S "$1" 2>/dev/null | awk -F: 'NF==2 {n=$1; v=$2; gsub(/[ \t]/,"",n); gsub(/[ \t]/,"",v)
+    if (v ~ /^[0-9]+$/ && tolower(n) ~ /^rx[-_]?(queue[-_]?)?[0-9]+[-_.]packets$/) print n, v}'
+}
 cpustat() {  # -> "steal total" (user..steal jiffies), summed in bash so large values stay integers
   local cpu f t=0
   read -r cpu f[1] f[2] f[3] f[4] f[5] f[6] f[7] f[8] _ < /proc/stat
@@ -203,29 +213,75 @@ msg INFO "net.core.default_qdisc = ${dq:-?} (qdisc new interfaces get; fq_codel 
 ring_of() {  # IFACE RX|TX -> "max cur"
   ethtool -g "$1" 2>/dev/null | awk -v k="$2:" '/^Pre-set/{s=1} /^Current/{s=2} $1==k{if(s==1)m=$2; else if(s==2)c=$2} END{print m, c}'
 }
-nnic=0; PHYS=(); declare -A TXCUR TXMAX
+nnic=0; PHYS=(); declare -A TXCUR TXMAX RXCUR RXMAX QCUR QMAX DRV
+RX_PERSIST="Persist RX ring sizes in your network config (systemd .link RxBufferSize, NetworkManager ethtool.ring-rx, ifupdown post-up). ethtool -G resets the link on many drivers - live calls drop, so use a maintenance window."
 for n in /sys/class/net/*; do
   i=$(basename "$n"); [ -e "$n/device" ] || continue
   nnic=$((nnic+1)); PHYS+=("$i")
-  drops=0   # ring/FIFO overflow only; rx_dropped is reported separately (often not buffer-related)
+  drv=$(basename "$(readlink -f "$n/device/driver" 2>/dev/null)" 2>/dev/null); DRV[$i]=$drv
+  drops=0   # ring/FIFO overflow per the generic counters; rx_dropped is reported separately (often not buffer-related)
   for c in rx_missed_errors rx_fifo_errors; do v=$(rd "$n/statistics/$c"); drops=$((drops+${v:-0})); done
   rxd=$(rd "$n/statistics/rx_dropped"); rxd=${rxd:-0}
-  rring="?"; rcur=""; rmax=""; tring="?"; tcur=""; tmax=""; chan="?"
+  rring="?"; rcur=""; rmax=""; tring="?"; tcur=""; tmax=""; chan="?"; qcur=""; qmax=""; coal=""
+  hostc=""; portc=""
   if has ethtool; then
     read -r rmax rcur <<<"$(ring_of "$i" RX)"; [ -n "$rcur" ] && rring="$rcur/$rmax"
     read -r tmax tcur <<<"$(ring_of "$i" TX)"; [ -n "$tcur" ] && tring="$tcur/$tmax"
-    TXCUR[$i]=$tcur; TXMAX[$i]=$tmax
-    chan=$(ethtool -l "$i" 2>/dev/null | awk '/^Pre-set/{s=1} /^Current/{s=2} /^Combined:/{if(s==1)m=$2; else if(s==2)c=$2} END{if(c!="")print c"/"m}')
-    chan=${chan:-?}
+    TXCUR[$i]=$tcur; TXMAX[$i]=$tmax; RXCUR[$i]=$rcur; RXMAX[$i]=$rmax
+    read -r qmax qcur <<<"$(ethtool -l "$i" 2>/dev/null | awk '/^Pre-set/{s=1} /^Current/{s=2} /^Combined:/{if(s==1)m=$2; else if(s==2)c=$2} END{print m, c}')"
+    [ -n "$qcur" ] && chan="$qcur/$qmax"; QCUR[$i]=$qcur; QMAX[$i]=$qmax
+    coal=$(ethtool -c "$i" 2>/dev/null | awk '/^Adaptive RX:/{a=$3} /^rx-usecs:/{u=$2} END{if(a!=""||u!="") printf "adaptive-rx %s rx-usecs %s", (a==""?"?":a), (u==""?"?":u)}')
+    # driver-specific RX loss counters, split into host-ring and NIC/port-level
+    while read -r k v; do
+      { [ -z "$k" ] || [ "$v" = 0 ]; } && continue
+      if rxport "$k"; then portc+="$k=$v "; else hostc+="$k=$v "; fi
+    done < <(rxstat "$i")
   fi
-  msg INFO "$i: speed $(rd "$n/speed")Mb/s  rings cur/max: rx $rring tx $tring  combined queues $chan  rx missed/fifo since boot $drops  rx_dropped $rxd"
-  if [ "$drops" -gt 0 ] && isnum "$rcur" && isnum "$rmax" && [ "$rcur" -lt "$rmax" ]; then
-    msg WARN "$i has $drops RX ring overflows (missed/fifo) with RX ring below max - raise it: ethtool -G $i rx $rmax (may briefly reset the link)"
-    note "Persist the RX ring size for $i in your network config (systemd .link RxBufferSize, NetworkManager ethtool.ring-rx, ifupdown post-up)."
-  elif [ "$drops" -gt 0 ]; then
-    msg WARN "$i has $drops RX ring overflows (missed/fifo) with the ring already at max - the CPU side isn't keeping up; check queues/IRQ spread: ethtool -l $i; ethtool -S $i | grep -iE 'drop|miss|fifo|no_buf'"
-  elif [ "$rxd" -gt 0 ]; then
-    msg INFO "$i rx_dropped=$rxd with no ring overflows - usually discarded traffic (unknown protocol, unconfigured VLAN), not a buffer problem"
+  msg INFO "$i: driver ${drv:-?}  speed $(rd "$n/speed")Mb/s  rings cur/max: rx $rring tx $tring  combined queues $chan${coal:+  coalescing: $coal}"
+  hostc=${hostc% }; portc=${portc% }
+  msg INFO "$i: RX since boot: missed/fifo $drops  rx_dropped $rxd  driver ring counters: ${hostc:-none non-zero}  port/PHY counters: ${portc:-none non-zero}"
+
+  # Ring overflow evidence: generic missed/fifo, or the driver's own host-side counters
+  ringev=0; { [ "$drops" -gt 0 ] || [ -n "$hostc" ]; } && ringev=1
+  belowmax=0; isnum "$rcur" && isnum "$rmax" && [ "$rcur" -lt "$rmax" ] && belowmax=1
+  if [ $ringev -eq 1 ] && [ $belowmax -eq 1 ]; then
+    msg WARN "$i: RX ring has overflowed since boot and is at $rcur of max $rmax - raise it: ethtool -G $i rx $rmax (live sample below shows whether it's happening now)"
+    note "$i: $RX_PERSIST"
+  elif [ $ringev -eq 1 ]; then
+    msg WARN "$i: RX ring has overflowed since boot and is already at max ($rmax) - the CPU side isn't keeping up; spread the load (queues, IRQs, UDP hash) rather than buffering more"
+    note "$i RX ring at max and still overflowing: 1) ethtool -l $i - use all combined queues; 2) check its IRQs land on several CPUs: grep -E '$i|${drv:-$i}' /proc/interrupts; 3) UDP hash must include ports (see the rx-flow-hash line); 4) look for busy CPUs in softirq: mpstat -P ALL 1 (%soft)."
+  elif [ "$rxd" -gt 0 ] && [ -z "$portc" ]; then
+    msg INFO "$i rx_dropped=$rxd with no ring overflows - usually discarded traffic (unknown protocol, unconfigured VLAN, standby bond slave), not a buffer problem"
+  fi
+  if [ -n "$portc" ]; then
+    msg WARN "$i: NIC/port-level RX drops since boot ($portc) - the NIC's own buffer overflowed before packets reached the ring; a bigger ring won't fix this"
+    note "$i port/PHY RX drops: check PCIe link (lspci -vv: LnkSta speed/width vs LnkCap), flow control (ethtool -a $i), and whether the NIC's queues are being drained (see the ring checks)."
+  fi
+
+  # Small default ring with no evidence yet: suggest a moderate preemptive raise
+  if [ $ringev -eq 0 ] && isnum "$rcur" && isnum "$rmax" && [ "$rcur" -le 512 ] && [ "$rmax" -gt "$rcur" ]; then
+    want=$(( rmax < 2048 ? rmax : 2048 ))
+    msg INFO "$i: RX ring at $rcur (max $rmax) - small for a high packet-rate media server; $want gives $((want/rcur))x the stall headroom (see fill time in the live sample)"
+    note "$i: optional preemptive raise: ethtool -G $i rx $want. $RX_PERSIST"
+  fi
+  case $drv in virtio_net|virtio-pci|virtio_pci)
+    note "$i is virtio (VM guest): the RX ring maximum is set by the hypervisor (QEMU rx_queue_size, up to 1024), and when this ring overflows the drop is counted on the HOST, as tx_dropped on the VM's tap interface - check there, not only here.";;
+  esac
+
+  # RSS: with several queues, the UDP hash must include ports or one carrier's RTP lands on one CPU
+  if isnum "$qcur" && [ "$qcur" -gt 1 ] && has ethtool; then
+    fh=$(ethtool -n "$i" rx-flow-hash udp4 2>/dev/null)
+    if grep -q 'L4 bytes' <<<"$fh"; then
+      msg OK "$i: UDP RSS hash includes ports - RTP spreads across $qcur queues"
+    elif grep -q 'IP SA' <<<"$fh"; then
+      msg WARN "$i: UDP RSS hash uses IP addresses only - all RTP between two hosts (e.g. you and one carrier/SBC) lands on ONE queue and ONE CPU"
+      note "$i: hash UDP on ports too: ethtool -N $i rx-flow-hash udp4 sdfn (and udp6). Persist it like the ring settings (NetworkManager ethtool, ifupdown post-up, or a systemd service)."
+    else
+      msg INFO "$i: UDP RSS hash not reported by the driver (ethtool -n $i rx-flow-hash udp4)"
+    fi
+  fi
+  if isnum "$qcur" && isnum "$qmax" && [ "$qcur" -lt "$qmax" ] && [ "$qcur" -lt "$ncpu" ]; then
+    msg INFO "$i: using $qcur of $qmax combined queues on a $ncpu-CPU host - more queues spread RX across more CPUs: ethtool -L $i combined $(( qmax < ncpu ? qmax : ncpu ))"
   fi
 
   # TX side: tx_dropped is cumulative since the interface came up
@@ -271,10 +327,13 @@ fi
 if isnum "$SAMPLE" && [ "$SAMPLE" -gt 0 ]; then
   section "Live ${SAMPLE}s sample (is it happening right now?)"
   a_rcv=$(udpstat Udp RcvbufErrors); a_in=$(udpstat Udp InErrors); read -r a_sd _ <<<"$(softnet)"; read -r a_st a_tt <<<"$(cpustat)"
-  declare -A A_TXD A_QD A_TXS A_CAR
+  declare -A A_TXD A_QD A_TXS A_CAR A_RXM A_RXS A_RXP A_RXQ
+  rxmiss() { local c v s=0; for c in rx_missed_errors rx_fifo_errors; do v=$(rd "/sys/class/net/$1/statistics/$c"); s=$((s + ${v:-0})); done; echo "$s"; }
   for i in "${PHYS[@]}"; do
     A_TXD[$i]=$(rd "/sys/class/net/$i/statistics/tx_dropped"); A_CAR[$i]=$(rd "/sys/class/net/$i/carrier_changes")
-    has tc && A_QD[$i]=$(qdrop "$i"); has ethtool && A_TXS[$i]=$(txstat "$i")
+    A_RXM[$i]=$(rxmiss "$i"); A_RXP[$i]=$(rd "/sys/class/net/$i/statistics/rx_packets")
+    has tc && A_QD[$i]=$(qdrop "$i")
+    if has ethtool; then A_TXS[$i]=$(txstat "$i"); A_RXS[$i]=$(rxstat "$i"); A_RXQ[$i]=$(rxqpkts "$i"); fi
   done
   sleep "$SAMPLE"
   b_rcv=$(udpstat Udp RcvbufErrors); b_in=$(udpstat Udp InErrors); read -r b_sd _ <<<"$(softnet)"; read -r b_st b_tt <<<"$(cpustat)"
@@ -321,6 +380,73 @@ if isnum "$SAMPLE" && [ "$SAMPLE" -gt 0 ]; then
         note "$i: driver-level TX drops with the TX ring at ${TXCUR[$i]} of max ${TXMAX[$i]} - this is the case where raising it can help: ethtool -G $i tx ${TXMAX[$i]} (may briefly reset the link). Restart/busy counters alone are backpressure, not loss."
       else
         note "$i: driver-level TX drops with the TX ring already at max - check ethtool -S $i for the counter that matches, and BQL: /sys/class/net/$i/queues/tx-*/byte_queue_limits/{limit,inflight}"
+      fi
+    fi
+  done
+
+  # RX: new ring overflows, and how much stall the RX ring can absorb at the current packet rate
+  cdelta() {  # "BEFORE name value lines" "AFTER name value lines" -> "name+delta ..." for counters that grew
+    local -A b=(); local k v out=""
+    while read -r k v; do [ -n "$k" ] && b[$k]=$v; done <<<"$1"
+    while read -r k v; do
+      [ -n "$k" ] && isnum "$v" && isnum "${b[$k]}" && [ "$v" -gt "${b[$k]}" ] && out+="$k+$((v - ${b[$k]})) "
+    done <<<"$2"
+    echo "$out"
+  }
+  for i in "${PHYS[@]}"; do
+    dm=$(( $(rxmiss "$i") - ${A_RXM[$i]:-0} ))
+    dp=$(( $(rd "/sys/class/net/$i/statistics/rx_packets") - ${A_RXP[$i]:-0} ))
+    hostg=""; portg=""; qmaxd=0; qname=""
+    if has ethtool; then
+      for kv in $(cdelta "${A_RXS[$i]}" "$(rxstat "$i")"); do
+        if rxport "${kv%%+*}"; then portg+="$kv "; else hostg+="$kv "; fi
+      done
+      for kv in $(cdelta "${A_RXQ[$i]}" "$(rxqpkts "$i")"); do   # busiest RX queue in the window
+        v=${kv##*+}; [ "$v" -gt "$qmaxd" ] && { qmaxd=$v; qname=${kv%%+*}; }
+      done
+    fi
+    rcur=${RXCUR[$i]}; rmax=${RXMAX[$i]}
+
+    if [ "$dm" -gt 0 ] || [ -n "$hostg" ]; then
+      ev=""; [ "$dm" -gt 0 ] && ev="rx_missed/fifo+$dm "; ev+=$hostg
+      msg FAIL "$i: RX ring overflowing NOW - ${ev% } in ${SAMPLE}s"
+      if isnum "$rcur" && isnum "$rmax" && [ "$rcur" -lt "$rmax" ]; then
+        note "$i: live RX ring overflow with the ring at $rcur of max $rmax - raise it: ethtool -G $i rx $rmax. $RX_PERSIST"
+      else
+        note "$i: live RX ring overflow with the ring at max - spread the load: all combined queues (ethtool -L), IRQs on several CPUs, UDP hash with ports, and find the CPU stuck in softirq (mpstat -P ALL 1)."
+      fi
+    else
+      msg OK "$i: no new RX ring overflows"
+    fi
+    [ -n "$portg" ] && msg FAIL "$i: NIC/port-level RX drops NOW (${portg% }) - the NIC's own buffer is overflowing; check PCIe link and flow control, not the ring"
+
+    # Fill time: how long the RX ring absorbs a stalled CPU at the busiest queue's packet rate
+    if isnum "$rcur" && [ "$rcur" -gt 0 ] && [ "$dp" -le 0 ]; then
+      msg INFO "$i: no RX traffic during the sample - ring headroom not estimated"
+    elif isnum "$rcur" && [ "$rcur" -gt 0 ]; then
+      pps=$(( dp / SAMPLE ))
+      if [ "$qmaxd" -gt 0 ]; then
+        qpps=$(( qmaxd / SAMPLE )); basis="busiest queue $qname"
+      elif isnum "${QCUR[$i]}" && [ "${QCUR[$i]}" -gt 0 ]; then
+        qpps=$(( pps / ${QCUR[$i]} )); basis="average of ${QCUR[$i]} queues (driver has no per-queue counters; the busiest queue may be higher)"
+      else
+        qpps=$pps; basis="single queue"
+      fi
+      [ "$qpps" -gt "$pps" ] && qpps=$pps   # never more than the interface total
+      if [ "$qpps" -le 0 ]; then
+        msg INFO "$i: RX ~$pps pps - too little traffic to estimate ring headroom; re-run at peak"
+      else
+        fill=$(( rcur * 1000 / qpps ))
+        line="$i: RX ~$pps pps, ~$qpps pps on the $basis -> RX ring of $rcur fills in ~${fill} ms if that CPU stalls"
+        if [ "$fill" -lt 10 ]; then
+          msg WARN "$line - under 10 ms; a short softirq or SMI stall will drop packets"
+          isnum "$rmax" && [ "$rcur" -lt "$rmax" ] && note "$i: RX ring headroom ${fill} ms at current load; raising to $rmax gives ~$(( rmax * 1000 / qpps )) ms: ethtool -G $i rx $rmax. $RX_PERSIST"
+        elif [ "$fill" -lt 20 ]; then
+          msg INFO "$line - under one 20 ms RTP interval; consider a larger ring${rmax:+ (max $rmax)}"
+        else
+          msg OK "$line"
+        fi
+        [ "$pps" -lt 1000 ] && msg INFO "$i: traffic during the sample was light - fill time at peak will be lower; re-run during your busiest hour"
       fi
     fi
   done
