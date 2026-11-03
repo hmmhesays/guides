@@ -496,14 +496,16 @@ FreeSWITCH can run media threads with realtime scheduling. `kernel.sched_rt_runt
 
 Section header: **Physical NICs (rings, queues, txqueuelen, drops)**
 
-For each interface backed by a device (physical NICs, and virtio NICs inside VMs), the script reports two lines:
+For each interface backed by a device (physical NICs, and virtio NICs inside VMs), the script reports:
 
 ```
-eno1: speed 10000Mb/s  rings cur/max: rx 512/4096 tx 512/4096  combined queues 8/8  rx missed/fifo since boot 0  rx_dropped 0
+eno1: driver ixgbe  speed 10000Mb/s  rings cur/max: rx 512/4096 tx 512/4096  combined queues 8/8  coalescing: adaptive-rx on rx-usecs 1
+eno1: RX since boot: missed/fifo 0  rx_dropped 0  driver ring counters: none non-zero  port/PHY counters: none non-zero
+eno1: UDP RSS hash includes ports - RTP spreads across 8 queues
 eno1: qdisc mq  txqueuelen 1000  tx_dropped 0 of 9581273 packets
 ```
 
-It also reports `net.core.default_qdisc` once at the top of the section.
+plus any WARN, INFO and NOTE lines the RX and TX checks below produce. It also reports `net.core.default_qdisc` once at the top of the section.
 
 ### RX and TX rings
 
@@ -520,20 +522,131 @@ The ring is a circle of descriptors shared between NIC and driver. The NIC write
                                 |
                      kernel (NAPI) reads here
 
-  Ring full -> NIC has nowhere to put the next packet -> rx_missed_errors
+  Ring full -> NIC has nowhere to put the next packet -> overflow drop
 ```
 
-* A larger RX ring absorbs longer bursts (or longer softirq delays) before the NIC drops.
-* It doesn't make processing faster, and a full large ring adds latency. Raise it when you see `rx_missed_errors` / `rx_fifo_errors`, not by default.
-* The script counts only `rx_missed_errors` + `rx_fifo_errors` as ring overflows. It suggests raising the ring when there are overflows **and** the ring is below its maximum; if the ring is already at max, it points you at queues and IRQ spread instead, because the CPU side is the bottleneck.
+The RX ring is the one ring worth tuning on a voice server. Packets only pile up in it when the CPU serving that queue is briefly behind, so a bigger RX ring trades "lost" for "a little late". For RTP that's a good trade: the far end's jitter buffer absorbs late packets but can only conceal lost ones.
+
+#### How much headroom does the RX ring give?
+
+Each RX queue has its own ring, so what matters is the packet rate on the **busiest queue**, not the whole NIC:
+
+```
+  fill time = RX ring size / packets per second on that queue
+            = how long that queue's CPU can stall before packets drop
+
+  200,000 pps total, spread over 8 RSS queues = 25,000 pps per queue
+     ring  256  ->  ~10 ms
+     ring  512  ->  ~20 ms
+     ring 2048  ->  ~80 ms
+     ring 4096  -> ~160 ms
+
+  Same traffic, but the UDP hash ignores ports and one carrier's RTP
+  all lands on ONE queue (say 120,000 pps):
+     ring  512  ->   ~4 ms     <- drops on any hiccup
+     ring 4096  ->  ~34 ms
+```
+
+Stalls of 5-20 ms are realistic on a busy box: a long softirq run on a queue's CPU, a System Management Interrupt from firmware, a page-reclaim pause, or another queue's interrupts landing on the same CPU. The script's targets:
+
+| Fill time at the busiest queue | Level | Meaning |
+|--------------------------------|-------|---------|
+| under 10 ms                    | WARN  | A short stall will drop packets. Raise the ring (and fix the spread). |
+| 10-20 ms                       | INFO  | Less than one 20 ms RTP interval of headroom. Consider a larger ring. |
+| 20 ms or more                  | OK    | |
+
+The live sample (section 12) measures this from real traffic. It uses the driver's per-queue packet counters when it can find them (`rx_queue_0_packets`, `rx-0.packets`, `rx0_packets` and similar); otherwise it divides the total by the queue count and says so, because an uneven spread makes the busiest queue higher than the average. **Run it at peak**: at 3 a.m. every ring looks huge.
+
+#### Should you raise it before you see drops?
+
+Moderately, yes. Many drivers default to 256 or 512 descriptors, which is tuned for general-purpose servers. For a high packet-rate media server:
+
+* **Preemptive:** 1024-2048 is a reasonable step with no evidence at all. The script reports a ring of 512 or less as INFO and suggests `min(2048, max)`.
+* **Up to the maximum:** when you see overflows, or the fill time at peak is under 20 ms.
+* **What a bigger ring costs:** memory (each descriptor holds a receive buffer, typically 2 KB or more, per queue: 4096 x 8 queues x 2 KB = 64 MB) and CPU cache footprint. It's not latency for well-behaved traffic: packets only wait in a ring that's already backed up.
+
+Either way, `ethtool -G` reinitialises the NIC on many drivers, dropping the link for a second or two and cutting audio on live calls. Do it in a maintenance window, and persist it (section 14).
 
 ```bash
 ethtool -g eno1                 # current and max
-ethtool -G eno1 rx 4096         # raise RX only (may briefly reset the link)
-ethtool -S eno1 | grep -iE 'drop|miss|fifo|no_buf'
+ethtool -G eno1 rx 2048         # RX only; may reset the link
 ```
 
-`rx_dropped` in `/sys/class/net/<nic>/statistics` also counts packets the kernel discarded for reasons unrelated to buffer space (unknown protocol, VLAN not configured, and so on). If `rx_missed_errors` and `rx_fifo_errors` are zero and only `rx_dropped` grows, it's usually not a ring problem.
+#### Finding RX ring overflows: generic and driver counters
+
+The kernel's generic counters for "ring full" are `rx_missed_errors` and `rx_fifo_errors` in `/sys/class/net/<nic>/statistics/`. **Not every driver uses them.** Many report ring exhaustion only in their own `ethtool -S` statistics, so the script reads both. It collects every driver counter whose name contains `rx` and one of `drop`, `discard`, `miss`, `no_buf`, `out_of_buf`, `no_dma`, `no_desc`, `fifo` or `overrun`, and sorts them into two groups:
+
+```
+                          NIC                                   host memory
+  wire --> [ port / PHY buffer ] --PCIe DMA--> [ RX ring (descriptors) ] --> CPU (NAPI)
+                  |                                     |
+         port/PHY drop                           ring overflow drop
+      "the NIC couldn't push               "no free descriptor: the CPU
+       packets to the host fast             hasn't drained the ring"
+       enough"                              -> bigger ring helps,
+      -> bigger ring does NOT help             or spread load to more CPUs
+```
+
+Typical names (they vary by driver and version; check `ethtool -S <nic>` on yours):
+
+| Driver family | Ring overflow (host side)                           | NIC/port-level                  |
+|---------------|-----------------------------------------------------|---------------------------------|
+| igb, e1000e   | `rx_no_buffer_count`, `rx_missed_errors`            |                                 |
+| ixgbe         | `rx_no_dma_resources`, `rx_missed_errors`           |                                 |
+| i40e, ice     | `port.rx_dropped`                                   |                                 |
+| mlx5          | `rx_out_of_buffer`                                  | `rx_discards_phy`               |
+| bnxt          | `rx_discards`, `rx_total_discard_pkts`              |                                 |
+
+* **Host-ring group:** everything not classed as port/PHY. Any of these non-zero counts as ring-overflow evidence, the same as `rx_missed_errors`.
+* **Port/PHY group:** counter names ending in `_phy` (or containing `_phy_`) or starting with `phy_` or `mac_`. These mean the NIC's own on-chip buffer overflowed before packets could be DMA'd to the host. Usual causes: the PCIe link negotiated below its capability (`lspci -vv`, compare `LnkSta` to `LnkCap`), or flow control/pause frames (`ethtool -a`). Full RX rings can also back up into the NIC's buffer, but then the host-ring counters move too; fix those first. The script reports port/PHY drops separately and never suggests a bigger ring for them on their own.
+* **Excluded:** `rx_dropped` (see below), the generic `rx_missed_errors`/`rx_fifo_errors` copies (already counted), and XDP drop counters (packets an XDP program dropped on purpose).
+
+The grouping is a name-based heuristic. If your driver uses a name the patterns miss, check `ethtool -S <nic> | grep -i rx` by hand.
+
+`rx_dropped` in `/sys/class/net/<nic>/statistics` counts packets the kernel discarded for reasons unrelated to buffer space (unknown protocol, VLAN not configured, the standby slave of an active-backup bond, and so on). If it's the only RX counter growing, it's usually not a ring problem, and the script reports it as INFO.
+
+#### What the script reports for RX
+
+In the NIC section (since boot):
+
+| Situation | Result | NOTE added |
+|-----------|--------|------------|
+| Ring overflows, ring below max | WARN | Raise to max; how to persist it. |
+| Ring overflows, ring already at max | WARN | Spread the load: queues, IRQs, UDP hash, softirq CPU. |
+| Port/PHY drops | WARN | PCIe link, flow control. Not the ring. |
+| No overflows, ring at 512 or less | INFO | Optional preemptive raise to `min(2048, max)`. |
+| Only `rx_dropped` | INFO | Not a buffer problem. |
+| UDP RSS hash ignores ports (more than 1 queue) | WARN | `ethtool -N <nic> rx-flow-hash udp4 sdfn`. |
+| Fewer combined queues than max, and fewer than CPUs | INFO | `ethtool -L <nic> combined <n>`. |
+| Driver is virtio (VM guest) | NOTE | Ring max is set by the hypervisor; overflows are counted on the host's tap. |
+
+In the live sample (per NIC, over the sample window):
+
+| Situation | Result |
+|-----------|--------|
+| Generic or host-ring driver counters grew | FAIL, with the counters that moved and a raise-or-spread NOTE |
+| Port/PHY counters grew | FAIL |
+| Fill time at the busiest queue under 10 ms | WARN, with how much a raise to max would give |
+| Fill time 10-20 ms | INFO |
+| Fill time 20 ms or more | OK |
+| Under 1,000 pps during the sample | INFO: too light to judge; re-run at peak |
+
+#### When the ring is at max and still overflowing
+
+A bigger ring only buys time. If the ring is at its maximum and still overflows, the CPU serving that queue can't keep up, and the fix is to spread the work:
+
+1. **Use all queues:** `ethtool -l <nic>`, then `ethtool -L <nic> combined <n>` up to the CPU count.
+2. **Spread the IRQs:** `grep <nic or driver> /proc/interrupts` should show each queue's interrupt on a different CPU. Keep irqbalance running, or pin them by hand.
+3. **Hash UDP on ports** (next section) so one busy peer doesn't land on one queue.
+4. **Find the hot CPU:** `mpstat -P ALL 1` and look for one CPU with high `%soft`.
+
+#### Interrupt coalescing
+
+The script reports `adaptive-rx` and `rx-usecs` from `ethtool -c`. Coalescing makes the NIC wait up to `rx-usecs` microseconds to batch interrupts. At media packet rates the ring only needs to hold `rx-usecs` worth of packets (25,000 pps x 100 µs = 3 packets), so coalescing rarely causes overflows on its own. It's reported for context: a very high fixed `rx-usecs` (hundreds of µs) with `adaptive-rx off` adds receive latency, and turning coalescing off entirely (`rx-usecs 0`) raises interrupt load, which can make overflows worse.
+
+#### VMs (virtio)
+
+Inside a VM, the virtio RX ring's maximum is set by the hypervisor (QEMU's `rx_queue_size`, up to 1024), not by the guest. When the guest doesn't drain it in time, the drop happens on the **host**, counted as `tx_dropped` on the VM's tap interface, so the guest's own counters can look clean. If FreeSWITCH runs in a VM, check the host side too.
 
 #### The TX ring: leave it at the default
 
@@ -571,12 +684,14 @@ Modern NICs have several RX/TX queue pairs, each with its own ring and interrupt
                         +--> queue 3 --> IRQ --> CPU 3
 ```
 
-* `ethtool -l <nic>` shows current vs maximum. If current is below max and you have the CPUs, raise it: `ethtool -L <nic> combined <n>`.
-* **UDP hashing caveat:** some drivers hash UDP on IP addresses only by default. All RTP from one carrier IP then lands on one queue and one CPU. Check and fix:
+* `ethtool -l <nic>` shows current vs maximum. If current is below max and you have the CPUs, raise it: `ethtool -L <nic> combined <n>`. The script reports this as INFO.
+* **UDP hashing caveat:** some drivers hash UDP on IP addresses only by default. All RTP between your box and one carrier or SBC then lands on one queue and one CPU, which is the fastest way to overflow one RX ring while the others sit idle. The script checks this whenever there's more than one queue and WARNs if the hash ignores ports. Check and fix:
   ```bash
   ethtool -n eno1 rx-flow-hash udp4      # want: IP SA, IP DA, L4 bytes 0&1, L4 bytes 2&3
   ethtool -N eno1 rx-flow-hash udp4 sdfn  # include source and destination ports
+  ethtool -N eno1 rx-flow-hash udp6 sdfn
   ```
+  Like ring sizes, this is lost on reboot or driver reload; persist it the same way (section 14). Not every driver supports changing it.
 
 ### txqueuelen and the qdisc
 
@@ -749,9 +864,10 @@ Counters since boot can be months old. The live sample (default 5 s, `SAMPLE=` t
 * softnet drops grew: **FAIL**.
 * `InErrors` grew: WARN.
 * Steal percentage for the window.
-* Per physical NIC: interface `tx_dropped` and root qdisc `dropped` over the window, plus the driver TX counters that moved, to say whether new TX loss is in the qdisc or the driver. The result and its NOTE are described in section 11 under "How the script reports TX".
+* Per physical NIC, RX: new ring overflows (generic `rx_missed_errors`/`rx_fifo_errors` and the driver's own host-ring counters), new port/PHY drops, and the RX ring's **fill time** at the busiest queue's measured packet rate. Results are described in section 11 under "What the script reports for RX".
+* Per physical NIC, TX: interface `tx_dropped` and root qdisc `dropped` over the window, plus the driver TX counters that moved, to say whether new TX loss is in the qdisc or the driver. The result and its NOTE are described in section 11 under "How the script reports TX".
 
-TX drops are often intermittent, so a 5-second window can miss them. When chasing TX loss, use a longer window during peak: `SAMPLE=60 sudo bash freeswitch-tuning-audit.sh`.
+Drops are often intermittent, so a 5-second window can miss them. When chasing RX or TX loss, use a longer window during peak: `SAMPLE=60 sudo bash freeswitch-tuning-audit.sh`. The RX fill time is also only meaningful at peak load: if fewer than 1,000 packets per second arrived during the sample, the script says so.
 
 Run the audit during your busiest hour for the live sample to mean something. A quiet 5 seconds at 3 a.m. proves little.
 
@@ -882,7 +998,7 @@ Two more points before using it as a fleet-wide baseline:
 
 `ethtool -G`, `ethtool -L`, `ethtool -N` and `ip link set ... txqueuelen` are lost on reboot or driver reload. Persist them with whatever manages your network.
 
-The examples below persist a larger **RX** ring, once ring overflows (section 11) justify it. The lines marked *conditional* are only for the specific evidence described in section 11; don't add them by default:
+The examples below persist a larger **RX** ring. Use 2048 (or the NIC's maximum, if lower) as a preemptive step, and the maximum once overflows or a short fill time at peak justify it (section 11). They also set the combined queue count; leave that out if the NIC already uses its maximum. The lines marked *conditional* are only for the specific evidence described in section 11; don't add them by default:
 
 * **TX ring:** only when TX loss is in the driver, not the qdisc.
 * **txqueuelen:** only when there are TX drops on `pfifo_fast` and you can't switch to `fq_codel`.
@@ -900,7 +1016,8 @@ MACAddress=aa:bb:cc:dd:ee:ff          # the NIC's permanent MAC (ip link show en
 NamePolicy=keep kernel database onboard slot path
 AlternativeNamesPolicy=database onboard slot path
 MACAddressPolicy=persistent
-RxBufferSize=4096
+RxBufferSize=2048                     # or the max (ethtool -g) once overflows justify it
+CombinedChannels=8                    # up to the max from ethtool -l
 # TxBufferSize=4096          # conditional
 # TransmitQueueLength=5000   # conditional
 ```
@@ -910,7 +1027,8 @@ Test with `udevadm test-builtin net_setup_link /sys/class/net/eno1` before reboo
 **NetworkManager:**
 
 ```bash
-nmcli connection modify eno1 ethtool.ring-rx 4096
+nmcli connection modify eno1 ethtool.ring-rx 2048
+nmcli connection modify eno1 ethtool.channels-combined 8   # recent NetworkManager versions
 # nmcli connection modify eno1 ethtool.ring-tx 4096   # conditional
 nmcli connection up eno1      # reapplies the connection: brief interruption
 ```
@@ -920,10 +1038,34 @@ nmcli connection up eno1      # reapplies the connection: brief interruption
 ```
 iface eno1 inet static
     ...
-    post-up /sbin/ethtool -G eno1 rx 4096
+    post-up /sbin/ethtool -G eno1 rx 2048
+    post-up /sbin/ethtool -L eno1 combined 8
+    post-up /sbin/ethtool -N eno1 rx-flow-hash udp4 sdfn
+    post-up /sbin/ethtool -N eno1 rx-flow-hash udp6 sdfn
     # post-up /sbin/ethtool -G eno1 tx 4096                 # conditional
     # post-up /sbin/ip link set dev eno1 txqueuelen 5000    # conditional
 ```
+
+**UDP RSS hash (any system):** systemd `.link` files and NetworkManager can't set `rx-flow-hash`, so on those systems use a small oneshot unit that runs after the network is up:
+
+```ini
+# /etc/systemd/system/nic-udp-hash.service
+[Unit]
+Description=Hash UDP on ports for RSS (RTP spread across queues)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/ethtool -N eno1 rx-flow-hash udp4 sdfn
+ExecStart=/usr/sbin/ethtool -N eno1 rx-flow-hash udp6 sdfn
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`systemctl daemon-reload && systemctl enable --now nic-udp-hash.service`. Check the path with `command -v ethtool`. If the driver is reloaded (a firmware update, for example), restart the unit.
 
 **udev rule (txqueuelen only, conditional):**
 
@@ -959,8 +1101,8 @@ Re-run the audit, and re-run it during peak load a day later. The goal is zero g
  remove it          raise max /            |              Swap in use? (sec 8)
                     notrack RTP     +------+-------+      Governor/C-states? (sec 10)
                                     |      |       |      Clocksource? (sec 9)
-                         UdpRcvbuf  softnet  NIC rx_missed     |
-                         Errors     dropped  / fifo        latency, not loss:
+                         UdpRcvbuf  softnet  NIC ring          |
+                         Errors     dropped  overflow     latency, not loss:
                             |         |         |          fix the stall source
                      rmem_default  backlog,  RX ring,
                      (sec 4);      RSS/RPS   queues,
@@ -1022,6 +1164,9 @@ ethtool -g  <nic>          # rings
 ethtool -l  <nic>          # queues
 ethtool -S  <nic>          # driver counters
 ethtool -n  <nic> rx-flow-hash udp4
+ethtool -c  <nic>          # interrupt coalescing
+ethtool -S  <nic> | grep -iE 'rx.*(drop|discard|miss|no_?buf|out_of_buf|no_dma|fifo)'
+lspci -vv -s "$(basename "$(readlink /sys/class/net/<nic>/device)")" | grep -E 'LnkCap|LnkSta' 
 tc -s qdisc show dev <nic>
 ip -s link show <nic>
 
