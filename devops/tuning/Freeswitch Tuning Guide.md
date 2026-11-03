@@ -476,10 +476,19 @@ Power-saving makes CPUs slow down and sleep when idle. Media load is idle most o
 
 * **Governor:** `performance` keeps clocks high. With `intel_pstate`, the `powersave` governor is actually dynamic and not as bad as the name suggests, but `performance` still has the lowest latency.
   ```bash
-  cpupower frequency-set -g performance
-  # or: tuned-adm profile latency-performance  (also handles C-states)
+  cpupower frequency-set -g performance      # now; lost at reboot
   ```
-  Also check the BIOS/UEFI power profile ("Max Performance" or "OS Control"). A firmware-controlled profile can override the OS.
+  `cpupower` alone doesn't survive a reboot. To make it permanent, see section 14, "CPU governor". Also check the BIOS/UEFI power profile ("Max Performance" or "OS Control"). A firmware-controlled profile can override the OS.
+* **How the script reports it:**
+
+  | Situation | Result |
+  |-----------|--------|
+  | Any CPU not on `performance` | WARN, with the driver name and a NOTE giving the command and the persistent unit |
+  | All on `performance`, and something sets it at boot | OK, naming what: a systemd unit, `tuned` profile, kernel build default, `cpufreq.default_governor=` on the cmdline, `sysfsutils` or `cpufrequtils` |
+  | All on `performance`, but nothing found that sets it at boot | INFO: it was probably set by hand and may revert after a reboot |
+  | No governor exposed | INFO (usual in VMs) |
+
+  The boot-time check searches `/etc/systemd/system` (units and drop-ins), `/etc/rc.local` and `/etc/network/interfaces` for a line that sets `performance`. A unit kept elsewhere, or a configuration-management agent that sets it after boot, won't be found, so treat the INFO as "check", not "broken".
 * **C-states:** limiting them (`intel_idle.max_cstate=1 processor.max_cstate=1` on the cmdline, or the `tuned` profile above) removes wake-up latency at the cost of power and heat. Do this only if you have measured jitter. Most boxes don't need it.
 * In a VM, there's usually no cpufreq governor to see; the hypervisor controls the real clocks.
 
@@ -1128,6 +1137,59 @@ WantedBy=multi-user.target
 SUBSYSTEM=="net", ACTION=="add", KERNEL=="eno1", ATTR{tx_queue_len}="5000"
 ```
 
+### CPU governor (Debian 12 and 13)
+
+`cpupower frequency-set -g performance` and writes to `scaling_governor` last only until the next reboot. Debian has no built-in setting for the governor, and the kernel's boot-time default can't be relied on for the drivers most servers use (next point). A small systemd unit is the reliable way, whichever driver is active (`intel_pstate`, `amd-pstate` or `acpi-cpufreq`).
+
+**Recommended: `cpupower` plus a oneshot unit**
+
+```bash
+apt install linux-cpupower
+```
+
+```ini
+# /etc/systemd/system/cpu-performance.service
+[Unit]
+Description=Set CPU frequency governor to performance
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/cpupower frequency-set -g performance
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+systemctl daemon-reload
+systemctl enable --now cpu-performance.service
+grep . /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor | awk -F: '{print $2}' | sort | uniq -c   # every CPU: performance
+```
+
+Without installing anything, use a direct sysfs write as the `ExecStart` line instead:
+
+```ini
+ExecStart=/bin/sh -c 'for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo performance > "$$g"; done'
+```
+
+The `$$` is deliberate: systemd expands `$g` itself before the shell runs, so a single `$` writes to an empty path and silently does nothing.
+
+**Why not the kernel parameter.** `cpufreq.default_governor=performance` on the kernel command line works for the generic drivers such as `acpi-cpufreq`. With `intel_pstate` in active mode (most current Intel servers), the kernel documentation ties the default policy to the `CONFIG_CPU_FREQ_DEFAULT_GOV_PERFORMANCE` build option (otherwise `powersave`) and doesn't say the generic parameter applies. Check your kernel's build default with `grep CONFIG_CPU_FREQ_DEFAULT_GOV /boot/config-$(uname -r)`. The unit sidesteps the question.
+
+**Energy/performance preference.** On Intel CPUs with hardware P-states, selecting `performance` also pins the energy/performance preference (EPP) to performance, and the driver rejects changes to it through sysfs. There's nothing extra to set.
+
+**Alternative: `tuned`.** `apt install tuned`, then `tuned-adm profile latency-performance`. It persists by itself and sets the governor, but also limits deep C-states (section 10): lower wake-up latency, more power and heat. Use either `tuned` or the unit, not both, or they'll fight over the setting.
+
+**Avoid `cpufrequtils`.** Older guides use the `cpufrequtils` package and `/etc/default/cpufrequtils`. `cpupower`, from Debian's `linux-cpupower` package, is the maintained tool built from the kernel source. The audit still recognises `cpufrequtils` if a host already uses it.
+
+**Also check:**
+
+* **The BIOS/UEFI power profile:** "OS Control" or "Maximum Performance". Some firmware modes override what the OS asks for.
+* **VMs:** a guest usually has no governor at all (the audit reports "no cpufreq governor exposed"). Frequency is controlled by the hypervisor, so set this on the KVM hosts.
+
+After a reboot, the audit's CPU line should read `OK CPU governor: performance(N) (set at boot by: boot script (cpu-performance.service))`.
+
 ### Kernel command line (THP, C-states)
 
 Edit `GRUB_CMDLINE_LINUX` in `/etc/default/grub`, then `update-grub` (Debian/Ubuntu) or `grub2-mkconfig -o /boot/grub2/grub.cfg` (RHEL family), and reboot.
@@ -1232,5 +1294,6 @@ lsmod | grep -E 'nf_(conntrack|nat)_sip'
 # timing / CPU
 cat /sys/devices/system/clocksource/clocksource0/current_clocksource
 cpupower frequency-info
+systemctl status cpu-performance.service   # if you persisted the governor that way
 mpstat -P ALL 1            # per-CPU load incl. %steal, %soft
 ```

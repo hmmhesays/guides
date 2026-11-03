@@ -202,10 +202,27 @@ govs=$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | s
 if [ -z "$govs" ]; then
   msg INFO "no cpufreq governor exposed (VM, or frequency fixed by firmware)"
 elif grep -qv '^performance(' <<<"$(tr ' ' '\n' <<<"$govs" | grep .)"; then
-  msg WARN "CPU governor: $govs- frequency ramp-up adds latency on bursty media load; performance is preferred"
-  note "CPU governor: cpupower frequency-set -g performance (or tuned-adm profile latency-performance); also check BIOS power profile"
+  msg WARN "CPU governor: $govs- frequency ramp-up adds latency on bursty media load; performance is preferred (driver: $(rd /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver))"
+  note "CPU governor, now: cpupower frequency-set -g performance (Debian: apt install linux-cpupower). Persist it with a oneshot unit /etc/systemd/system/cpu-performance.service: [Service] Type=oneshot ExecStart=/usr/bin/cpupower frequency-set -g performance RemainAfterExit=yes [Install] WantedBy=multi-user.target, then systemctl enable --now cpu-performance.service. Or use tuned-adm profile latency-performance (also limits C-states) - not both. Also set the BIOS power profile to OS control / max performance. Guide section 14."
 else
-  msg OK "CPU governor: $govs"
+  # performance now - but will it survive a reboot? Look for whatever sets it at boot.
+  persist=""
+  grep -q '^CONFIG_CPU_FREQ_DEFAULT_GOV_PERFORMANCE=y' "/boot/config-$(uname -r)" 2>/dev/null && persist+="kernel default (CONFIG_CPU_FREQ_DEFAULT_GOV_PERFORMANCE) "
+  grep -q 'cpufreq.default_governor=performance' /proc/cmdline && persist+="kernel cmdline cpufreq.default_governor "
+  units=$(grep -lsE 'frequency-set[^#]*(-g|--governor)[ =]*performance|performance[^#]*scaling_governor|scaling_governor[^#]*performance' \
+            /etc/systemd/system/*.service /etc/systemd/system/*/*.conf /etc/rc.local /etc/network/interfaces 2>/dev/null | xargs -r -n1 basename | paste -sd ' ')
+  [ -n "$units" ] && persist+="boot script ($units) "
+  if has tuned-adm && systemctl is-active -q tuned 2>/dev/null; then
+    tp=$(tuned-adm active 2>/dev/null | sed -n 's/^Current active profile: //p'); persist+="tuned profile ${tp:-?} "
+  fi
+  grep -qsE '^[[:space:]]*GOVERNOR=.?performance' /etc/default/cpufrequtils && persist+="cpufrequtils "
+  grep -qsE 'scaling_governor[[:space:]]*=[[:space:]]*performance' /etc/sysfs.conf /etc/sysfs.d/*.conf && persist+="sysfsutils "
+  if [ -n "$persist" ]; then
+    msg OK "CPU governor: $govs(set at boot by: ${persist% })"
+  else
+    msg INFO "CPU governor: $govs- but nothing found that sets it at boot (no unit, tuned profile, sysfsutils or kernel default); it may revert to powersave/schedutil after a reboot"
+    note "CPU governor persistence: on Debian 12/13 add a oneshot unit /etc/systemd/system/cpu-performance.service running /usr/bin/cpupower frequency-set -g performance (package linux-cpupower), WantedBy=multi-user.target, then systemctl enable cpu-performance.service. Guide section 14."
+  fi
 fi
 cst=$(grep -oE '(intel_idle\.max_cstate|processor\.max_cstate|idle)=[^ ]+' /proc/cmdline | paste -sd ' ')
 msg INFO "C-state limits on cmdline: ${cst:-none (deep C-states allowed; limit them only if you see wake-up jitter)}"
