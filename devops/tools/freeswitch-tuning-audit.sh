@@ -6,7 +6,7 @@
 # Kernel and NIC only - it does not read FreeSWITCH's config or inspect the process.
 #
 # Makes NO changes. Takes ~5 seconds (one live sample of drop counters and CPU steal).
-# Prints a suggested sysctl.d file and non-sysctl notes at the end.
+# Prints a suggested sysctl.d file, suggested NIC (ethtool) settings and other notes at the end.
 #
 # Usage (as root):  bash freeswitch-tuning-audit.sh | tee fs-tuning-report.txt
 # Optional:  SAMPLE=5  seconds for the live sample (0 to skip)
@@ -26,6 +26,15 @@ has()   { command -v "$1" >/dev/null 2>&1; }
 isnum() { [[ $1 =~ ^[0-9]+$ ]]; }
 sel()   { grep -o '\[[^]]*\]' <<<"$1" | tr -d '[]'; }   # selected value from "a [b] c"
 suggest() { SUGGEST+=("# [$(printf '%04d' "$ID")] $1" "$2"); }   # "reason" "key = value"
+# Suggested NIC changes, keyed by "iface kind" so a stronger recommendation replaces a weaker one
+declare -A NICVAL NICWHY
+nicfix() {  # IFACE KIND VALUE "reason"   KIND: rxring | queues | hash | txring  (rings/queues keep the larger value)
+  local k="$1 $2" id; id=$(printf '%04d' "$ID")
+  if [ "$2" = rxring ] || [ "$2" = txring ] || [ "$2" = queues ]; then
+    isnum "${NICVAL[$k]}" && [ "${NICVAL[$k]}" -ge "$3" ] && return
+  fi
+  NICVAL[$k]=$3; NICWHY[$k]="[$id] $4"
+}
 
 # tune LEVEL KEY OP WANT FIELD "reason"
 #   OP: ge | le | eq     FIELD: whitespace field to compare for multi-value keys (1 = first)
@@ -213,8 +222,7 @@ msg INFO "net.core.default_qdisc = ${dq:-?} (qdisc new interfaces get; fq_codel 
 ring_of() {  # IFACE RX|TX -> "max cur"
   ethtool -g "$1" 2>/dev/null | awk -v k="$2:" '/^Pre-set/{s=1} /^Current/{s=2} $1==k{if(s==1)m=$2; else if(s==2)c=$2} END{print m, c}'
 }
-nnic=0; PHYS=(); declare -A TXCUR TXMAX RXCUR RXMAX QCUR QMAX DRV
-RX_PERSIST="Persist RX ring sizes in your network config (systemd .link RxBufferSize, NetworkManager ethtool.ring-rx, ifupdown post-up). ethtool -G resets the link on many drivers - live calls drop, so use a maintenance window."
+nnic=0; PHYS=(); declare -A TXCUR TXMAX RXCUR RXMAX QCUR QMAX DRV HASHST
 for n in /sys/class/net/*; do
   i=$(basename "$n"); [ -e "$n/device" ] || continue
   nnic=$((nnic+1)); PHYS+=("$i")
@@ -245,8 +253,8 @@ for n in /sys/class/net/*; do
   ringev=0; { [ "$drops" -gt 0 ] || [ -n "$hostc" ]; } && ringev=1
   belowmax=0; isnum "$rcur" && isnum "$rmax" && [ "$rcur" -lt "$rmax" ] && belowmax=1
   if [ $ringev -eq 1 ] && [ $belowmax -eq 1 ]; then
-    msg WARN "$i: RX ring has overflowed since boot and is at $rcur of max $rmax - raise it: ethtool -G $i rx $rmax (live sample below shows whether it's happening now)"
-    note "$i: $RX_PERSIST"
+    msg WARN "$i: RX ring has overflowed since boot and is at $rcur of max $rmax - raise it to max (see Suggested NIC settings; the live sample shows whether it's happening now)"
+    nicfix "$i" rxring "$rmax" "$i: RX ring overflowed since boot at $rcur - raise to max"
   elif [ $ringev -eq 1 ]; then
     msg WARN "$i: RX ring has overflowed since boot and is already at max ($rmax) - the CPU side isn't keeping up; spread the load (queues, IRQs, UDP hash) rather than buffering more"
     note "$i RX ring at max and still overflowing: 1) ethtool -l $i - use all combined queues; 2) check its IRQs land on several CPUs: grep -E '$i|${drv:-$i}' /proc/interrupts; 3) UDP hash must include ports (see the rx-flow-hash line); 4) look for busy CPUs in softirq: mpstat -P ALL 1 (%soft)."
@@ -262,7 +270,7 @@ for n in /sys/class/net/*; do
   if [ $ringev -eq 0 ] && isnum "$rcur" && isnum "$rmax" && [ "$rcur" -le 512 ] && [ "$rmax" -gt "$rcur" ]; then
     want=$(( rmax < 2048 ? rmax : 2048 ))
     msg INFO "$i: RX ring at $rcur (max $rmax) - small for a high packet-rate media server; $want gives $((want/rcur))x the stall headroom (see fill time in the live sample)"
-    note "$i: optional preemptive raise: ethtool -G $i rx $want. $RX_PERSIST"
+    nicfix "$i" rxring "$want" "$i: RX ring $rcur of max $rmax - preemptive raise"
   fi
   case $drv in virtio_net|virtio-pci|virtio_pci)
     note "$i is virtio (VM guest): the RX ring maximum is set by the hypervisor (QEMU rx_queue_size, up to 1024), and when this ring overflows the drop is counted on the HOST, as tx_dropped on the VM's tap interface - check there, not only here.";;
@@ -272,16 +280,18 @@ for n in /sys/class/net/*; do
   if isnum "$qcur" && [ "$qcur" -gt 1 ] && has ethtool; then
     fh=$(ethtool -n "$i" rx-flow-hash udp4 2>/dev/null)
     if grep -q 'L4 bytes' <<<"$fh"; then
-      msg OK "$i: UDP RSS hash includes ports - RTP spreads across $qcur queues"
+      msg OK "$i: UDP RSS hash includes ports - RTP spreads across $qcur queues"; HASHST[$i]="UDP hash includes ports"
     elif grep -q 'IP SA' <<<"$fh"; then
-      msg WARN "$i: UDP RSS hash uses IP addresses only - all RTP between two hosts (e.g. you and one carrier/SBC) lands on ONE queue and ONE CPU"
-      note "$i: hash UDP on ports too: ethtool -N $i rx-flow-hash udp4 sdfn (and udp6). Persist it like the ring settings (NetworkManager ethtool, ifupdown post-up, or a systemd service)."
+      msg WARN "$i: UDP RSS hash uses IP addresses only - all RTP between two hosts (e.g. you and one carrier/SBC) lands on ONE queue and ONE CPU"; HASHST[$i]="UDP hash IP-only"
+      nicfix "$i" hash sdfn "$i: UDP RSS hash ignores ports - hash on ports so RTP spreads across queues"
     else
-      msg INFO "$i: UDP RSS hash not reported by the driver (ethtool -n $i rx-flow-hash udp4)"
+      msg INFO "$i: UDP RSS hash not reported by the driver (ethtool -n $i rx-flow-hash udp4)"; HASHST[$i]="UDP hash not reported by driver"
     fi
   fi
   if isnum "$qcur" && isnum "$qmax" && [ "$qcur" -lt "$qmax" ] && [ "$qcur" -lt "$ncpu" ]; then
-    msg INFO "$i: using $qcur of $qmax combined queues on a $ncpu-CPU host - more queues spread RX across more CPUs: ethtool -L $i combined $(( qmax < ncpu ? qmax : ncpu ))"
+    qwant=$(( qmax < ncpu ? qmax : ncpu ))
+    msg INFO "$i: using $qcur of $qmax combined queues on a $ncpu-CPU host - more queues spread RX across more CPUs (ethtool -L $i combined $qwant)"
+    nicfix "$i" queues "$qwant" "$i: $qcur of $qmax combined queues on $ncpu CPUs - use more"
   fi
 
   # TX side: tx_dropped is cumulative since the interface came up
@@ -377,7 +387,8 @@ if isnum "$SAMPLE" && [ "$SAMPLE" -gt 0 ]; then
       elif grep -qiE 'dma|timeout|hang|err' <<<"$grown"; then
         note "$i: driver TX fault counters moved ($grown) - a bigger ring won't help. Check dmesg for NETDEV WATCHDOG, driver/firmware versions (ethtool -i $i)."
       elif isnum "${TXCUR[$i]}" && isnum "${TXMAX[$i]}" && [ "${TXCUR[$i]}" -lt "${TXMAX[$i]}" ]; then
-        note "$i: driver-level TX drops with the TX ring at ${TXCUR[$i]} of max ${TXMAX[$i]} - this is the case where raising it can help: ethtool -G $i tx ${TXMAX[$i]} (may briefly reset the link). Restart/busy counters alone are backpressure, not loss."
+        note "$i: driver-level TX drops with the TX ring at ${TXCUR[$i]} of max ${TXMAX[$i]} - this is the case where raising it can help (added to Suggested NIC settings). Restart/busy counters alone are backpressure, not loss."
+        nicfix "$i" txring "${TXMAX[$i]}" "$i: driver-level TX drops in the live sample with TX ring at ${TXCUR[$i]} - raise to max"
       else
         note "$i: driver-level TX drops with the TX ring already at max - check ethtool -S $i for the counter that matches, and BQL: /sys/class/net/$i/queues/tx-*/byte_queue_limits/{limit,inflight}"
       fi
@@ -411,7 +422,7 @@ if isnum "$SAMPLE" && [ "$SAMPLE" -gt 0 ]; then
       ev=""; [ "$dm" -gt 0 ] && ev="rx_missed/fifo+$dm "; ev+=$hostg
       msg FAIL "$i: RX ring overflowing NOW - ${ev% } in ${SAMPLE}s"
       if isnum "$rcur" && isnum "$rmax" && [ "$rcur" -lt "$rmax" ]; then
-        note "$i: live RX ring overflow with the ring at $rcur of max $rmax - raise it: ethtool -G $i rx $rmax. $RX_PERSIST"
+        nicfix "$i" rxring "$rmax" "$i: RX ring overflowing during the live sample at $rcur - raise to max"
       else
         note "$i: live RX ring overflow with the ring at max - spread the load: all combined queues (ethtool -L), IRQs on several CPUs, UDP hash with ports, and find the CPU stuck in softirq (mpstat -P ALL 1)."
       fi
@@ -440,9 +451,10 @@ if isnum "$SAMPLE" && [ "$SAMPLE" -gt 0 ]; then
         line="$i: RX ~$pps pps, ~$qpps pps on the $basis -> RX ring of $rcur fills in ~${fill} ms if that CPU stalls"
         if [ "$fill" -lt 10 ]; then
           msg WARN "$line - under 10 ms; a short softirq or SMI stall will drop packets"
-          isnum "$rmax" && [ "$rcur" -lt "$rmax" ] && note "$i: RX ring headroom ${fill} ms at current load; raising to $rmax gives ~$(( rmax * 1000 / qpps )) ms: ethtool -G $i rx $rmax. $RX_PERSIST"
+          isnum "$rmax" && [ "$rcur" -lt "$rmax" ] && nicfix "$i" rxring "$rmax" "$i: RX ring fills in ~${fill} ms at current load - max $rmax gives ~$(( rmax * 1000 / qpps )) ms"
         elif [ "$fill" -lt 20 ]; then
           msg INFO "$line - under one 20 ms RTP interval; consider a larger ring${rmax:+ (max $rmax)}"
+          isnum "$rmax" && [ "$rcur" -lt "$rmax" ] && nicfix "$i" rxring "$rmax" "$i: RX ring fills in ~${fill} ms at current load - max $rmax gives ~$(( rmax * 1000 / qpps )) ms"
         else
           msg OK "$line"
         fi
@@ -482,6 +494,49 @@ if [ ${#SUGGEST[@]} -gt 0 ]; then
   echo "# ---- Suggested /etc/sysctl.d/90-freeswitch.conf (review before applying) ----"
   printf '%s\n' "${SUGGEST[@]}"
   echo "# Apply: sysctl --system"
+fi
+if [ "$nnic" -gt 0 ]; then
+  echo
+  echo "# ---- Suggested NIC settings (review before applying) ----"
+  if ! has ethtool; then
+    echo "# ethtool is not installed - ring, queue and UDP hash checks were skipped. Install it (package: ethtool) and re-run."
+  elif [ ${#NICVAL[@]} -eq 0 ]; then
+    echo "# No NIC changes suggested. Per-NIC status:"
+  else
+    echo "# MAINTENANCE WINDOW: ethtool -G and -L reinitialise the NIC on many drivers - the link drops"
+    echo "# for a second or two and live calls lose audio. Not persistent: see guide section 14."
+  fi
+  for i in "${PHYS[@]}"; do
+    has ethtool || break
+    if [ -z "${NICVAL[$i rxring]}${NICVAL[$i queues]}${NICVAL[$i hash]}${NICVAL[$i txring]}" ]; then
+      # Say why nothing is suggested, so an empty block isn't mistaken for a failed check
+      st="RX ring ${RXCUR[$i]:-?}/${RXMAX[$i]:-?}"
+      if ! isnum "${RXCUR[$i]}"; then st+=" (driver doesn't report ring sizes)"
+      elif [ "${RXCUR[$i]}" -ge "${RXMAX[$i]:-0}" ]; then st+=" (at max)"
+      else st+=" (above the 512 preemptive threshold, no overflows or short fill time seen)"; fi
+      st+=", queues ${QCUR[$i]:-?}/${QMAX[$i]:-?}"
+      isnum "${QCUR[$i]}" && [ "${QCUR[$i]}" -le 1 ] && st+=" (single queue - UDP hash not applicable)"
+      [ -n "${HASHST[$i]}" ] && st+=", ${HASHST[$i]}"
+      echo "# --- $i: no changes - $st"
+      continue
+    fi
+    echo "# --- $i ---"
+    if [ -n "${NICVAL[$i rxring]}" ]; then echo "# ${NICWHY[$i rxring]}"; echo "ethtool -G $i rx ${NICVAL[$i rxring]}"; fi
+    if [ -n "${NICVAL[$i txring]}" ]; then echo "# ${NICWHY[$i txring]}"; echo "ethtool -G $i tx ${NICVAL[$i txring]}"; fi
+    if [ -n "${NICVAL[$i queues]}" ]; then echo "# ${NICWHY[$i queues]}"; echo "ethtool -L $i combined ${NICVAL[$i queues]}"; fi
+    if [ -n "${NICVAL[$i hash]}" ]; then
+      echo "# ${NICWHY[$i hash]}"; echo "ethtool -N $i rx-flow-hash udp4 sdfn"; echo "ethtool -N $i rx-flow-hash udp6 sdfn"
+    fi
+    # Persistence equivalents for this NIC
+    link=""; nm=""
+    [ -n "${NICVAL[$i rxring]}" ] && { link+="RxBufferSize=${NICVAL[$i rxring]} "; nm+="ethtool.ring-rx ${NICVAL[$i rxring]} "; }
+    [ -n "${NICVAL[$i txring]}" ] && { link+="TxBufferSize=${NICVAL[$i txring]} "; nm+="ethtool.ring-tx ${NICVAL[$i txring]} "; }
+    [ -n "${NICVAL[$i queues]}" ] && { link+="CombinedChannels=${NICVAL[$i queues]} "; nm+="ethtool.channels-combined ${NICVAL[$i queues]} "; }
+    [ -n "$link" ] && echo "# persist: systemd .link [Link] ${link% } | nmcli connection modify <conn> ${nm% } | ifupdown: post-up the commands above"
+    [ -n "${NICVAL[$i hash]}" ] && echo "# persist the UDP hash with a oneshot unit (.link and NetworkManager can't set it): guide section 14, nic-udp-hash.service"
+  done
+  [ ${#NICVAL[@]} -gt 0 ] && echo "# Verify: ethtool -g <nic>; ethtool -l <nic>; ethtool -n <nic> rx-flow-hash udp4; then re-run this audit at peak"
+  [ "$(id -u)" -ne 0 ] && echo "# Not run as root: some ethtool queries may have failed - re-run with sudo for complete NIC results"
 fi
 if [ ${#NOTES[@]} -gt 0 ]; then
   echo

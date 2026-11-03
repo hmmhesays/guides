@@ -52,7 +52,8 @@ Every line has an incrementing ID, so you can refer to findings later (for examp
 At the end the script prints:
 
 * **A suggested `/etc/sysctl.d/90-freeswitch.conf`.** Every line carries the ID and reason of the finding that produced it. Review it before applying; it's a starting point, not a prescription.
-* **NOTE lines** for fixes that live outside sysctl.
+* **Suggested NIC settings:** the `ethtool` commands for each NIC that needs a change (RX ring, combined queues, UDP hash, and the TX ring only when driver-level TX loss was proven), each with the ID and reason of its finding, plus the matching persistence settings. These reset the link on many drivers, so they're maintenance-window work. The block always prints: a NIC that needs nothing gets a one-line status saying why (for example "RX ring 4096/4096 (at max), queues 8/8, UDP hash includes ports"), and a missing `ethtool` is called out. See section 14, "Recommended NIC baseline".
+* **NOTE lines** for everything else that lives outside sysctl and `ethtool`.
 
 > **Recommendations are targets for a busy box** (hundreds to thousands of concurrent channels). A small PBX with 20 calls will show WARNs it can safely ignore. Weigh every WARN against the evidence sections (12 and 13): a setting below target with zero drops is a low priority.
 
@@ -609,25 +610,25 @@ The grouping is a name-based heuristic. If your driver uses a name the patterns 
 
 In the NIC section (since boot):
 
-| Situation | Result | NOTE added |
-|-----------|--------|------------|
-| Ring overflows, ring below max | WARN | Raise to max; how to persist it. |
-| Ring overflows, ring already at max | WARN | Spread the load: queues, IRQs, UDP hash, softirq CPU. |
-| Port/PHY drops | WARN | PCIe link, flow control. Not the ring. |
-| No overflows, ring at 512 or less | INFO | Optional preemptive raise to `min(2048, max)`. |
-| Only `rx_dropped` | INFO | Not a buffer problem. |
-| UDP RSS hash ignores ports (more than 1 queue) | WARN | `ethtool -N <nic> rx-flow-hash udp4 sdfn`. |
-| Fewer combined queues than max, and fewer than CPUs | INFO | `ethtool -L <nic> combined <n>`. |
-| Driver is virtio (VM guest) | NOTE | Ring max is set by the hypervisor; overflows are counted on the host's tap. |
+| Situation | Result | Added to the output |
+|-----------|--------|---------------------|
+| Ring overflows, ring below max | WARN | NIC block: `ethtool -G <nic> rx <max>` |
+| Ring overflows, ring already at max | WARN | NOTE: spread the load (queues, IRQs, UDP hash, softirq CPU) |
+| Port/PHY drops | WARN | NOTE: PCIe link, flow control. Not the ring. |
+| No overflows, ring at 512 or less | INFO | NIC block: preemptive `ethtool -G <nic> rx <min(2048, max)>` |
+| Only `rx_dropped` | INFO | Nothing: not a buffer problem |
+| UDP RSS hash ignores ports (more than 1 queue) | WARN | NIC block: `ethtool -N <nic> rx-flow-hash udp4 sdfn` (and udp6) |
+| Fewer combined queues than max, and fewer than CPUs | INFO | NIC block: `ethtool -L <nic> combined <min(max, CPUs)>` |
+| Driver is virtio (VM guest) | INFO | NOTE: ring max is set by the hypervisor; overflows are counted on the host's tap |
 
 In the live sample (per NIC, over the sample window):
 
 | Situation | Result |
 |-----------|--------|
-| Generic or host-ring driver counters grew | FAIL, with the counters that moved and a raise-or-spread NOTE |
+| Generic or host-ring driver counters grew | FAIL, with the counters that moved. Ring below max: raise to max in the NIC block. At max: spread-the-load NOTE. |
 | Port/PHY counters grew | FAIL |
-| Fill time at the busiest queue under 10 ms | WARN, with how much a raise to max would give |
-| Fill time 10-20 ms | INFO |
+| Fill time at the busiest queue under 10 ms | WARN. Ring below max: raise to max in the NIC block, with the headroom that gives. |
+| Fill time 10-20 ms | INFO. Ring below max: raise to max in the NIC block. |
 | Fill time 20 ms or more | OK |
 | Under 1,000 pps during the sample | INFO: too light to judge; re-run at peak |
 
@@ -791,7 +792,7 @@ In the live sample (per NIC, over the sample window):
 | Qdisc dropped grew                               | FAIL   | Qdisc remedies; don't raise the TX ring. |
 | Interface grew, qdisc didn't, carrier changed    | FAIL   | Fix the link. |
 | Interface grew, qdisc didn't, fault counters moved | FAIL | Driver/firmware fault; ring won't help. |
-| Interface grew, qdisc didn't, TX ring below max  | FAIL   | Raise the TX ring. |
+| Interface grew, qdisc didn't, TX ring below max  | FAIL   | Raise the TX ring (also added to the NIC block). |
 | Interface grew, qdisc didn't, TX ring at max     | FAIL   | Check the matching driver counter and BQL. |
 | `tc` not installed                               | FAIL   | Install iproute2 to tell them apart. |
 
@@ -993,6 +994,59 @@ Two more points before using it as a fleet-wide baseline:
 
 * **INFO lines are optional.** On a small PBX, the 9 WARN lines are the ones that matter. The TCP lines only matter if you run SIP over TCP, TLS or WebSockets.
 * **Conntrack lines fail without the module.** If `nf_conntrack` isn't loaded at boot, `sysctl --system` reports those two keys as unknown and skips them. Either load the module first (`/etc/modules-load.d/`) or remove those lines on hosts with no stateful firewall.
+
+### Recommended NIC baseline
+
+The sysctl set above has a NIC counterpart. These three changes are worth making proactively on a FreeSWITCH host, before any drops:
+
+| Setting | Baseline | Why | Section |
+|---------|----------|-----|---------|
+| RX ring | 2048, or the NIC's maximum if lower. The maximum once overflows or a short fill time at peak justify it. | 4x the stall headroom of a 512 default, at a small memory cost | 11 |
+| Combined queues | The NIC's maximum, up to the CPU count | Spreads RX interrupts and softirq work across CPUs | 11 |
+| UDP RSS hash | Source and destination ports included (`sdfn`) for udp4 and udp6 | Stops one carrier's or SBC's RTP all landing on one queue and one CPU | 11 |
+
+What stays out of the baseline, and why:
+
+* **TX ring:** raise it only when the live sample proves driver-level TX loss (section 11). On a voice box a bigger TX ring mostly adds latency.
+* **txqueuelen:** only for TX drops on `pfifo_fast` when you can't switch to `fq_codel`.
+* **Interrupt coalescing:** leave the driver default (usually adaptive) unless you've measured a problem.
+
+The script's "Suggested NIC settings" block is this baseline applied to your hardware. For each NIC it prints only the commands that change something, with the target capped at that NIC's reported maximum and never below the current value. A NIC that already meets the baseline gets a one-line status instead, so an empty block is never ambiguous:
+
+```
+# ---- Suggested NIC settings (review before applying) ----
+# No NIC changes suggested. Per-NIC status:
+# --- eno1: no changes - RX ring 1024/4096 (above the 512 preemptive threshold, no overflows or short fill time seen), queues 8/8, UDP hash includes ports
+```
+
+A ring between 513 and the maximum with no overflows and a fill time of 20 ms or more is left alone on purpose: it already has the headroom the baseline aims for. A later, stronger finding replaces a weaker one: if the live sample shows a short fill time, the preemptive 2048 becomes the maximum. Example:
+
+```
+# ---- Suggested NIC settings (review before applying) ----
+# MAINTENANCE WINDOW: ethtool -G and -L reinitialise the NIC on many drivers - the link drops
+# for a second or two and live calls lose audio. Not persistent: see guide section 14.
+# --- eno1 ---
+# [0048] eno1: RX ring 512 of max 4096 - preemptive raise
+ethtool -G eno1 rx 2048
+# [0050] eno1: 4 of 8 combined queues on 16 CPUs - use more
+ethtool -L eno1 combined 8
+# [0049] eno1: UDP RSS hash ignores ports - hash on ports so RTP spreads across queues
+ethtool -N eno1 rx-flow-hash udp4 sdfn
+ethtool -N eno1 rx-flow-hash udp6 sdfn
+# persist: systemd .link [Link] RxBufferSize=2048 CombinedChannels=8 | nmcli connection modify <conn> ethtool.ring-rx 2048 ethtool.channels-combined 8 | ifupdown: post-up the commands above
+# persist the UDP hash with a oneshot unit (.link and NetworkManager can't set it): guide section 14, nic-udp-hash.service
+# Verify: ethtool -g <nic>; ethtool -l <nic>; ethtool -n <nic> rx-flow-hash udp4; then re-run this audit at peak
+```
+
+#### Applying it
+
+1. **Schedule a maintenance window, or drain the box.** `ethtool -G` and `ethtool -L` reinitialise the NIC on many drivers (Intel and Mellanox included): the link drops for a second or two, every live call loses audio, and SIP over TCP/TLS reconnects. Changing the UDP hash (`-N`) usually doesn't reset the link.
+2. **One NIC at a time on bonded hosts.** With an active-backup or LACP bond, change one slave, check it's back in the bond (`cat /proc/net/bonding/bond0`), then do the next. The bond rides through it instead of losing both legs at once.
+3. **Run the commands, then verify:** `ethtool -g <nic>`, `ethtool -l <nic>`, `ethtool -n <nic> rx-flow-hash udp4` (should list `L4 bytes 0 & 1` and `L4 bytes 2 & 3`).
+4. **Persist them** (next subsection), or they're lost at the next reboot or driver reload. Test the persistence with a reboot in the same window if you can.
+5. **Re-run the audit at peak.** The NIC block should be empty, and the live sample's fill time should be OK.
+
+Some drivers refuse a value even within the reported maximum (for example, some virtio and older drivers don't support `-G` or `-L` at all). `ethtool` then prints an error and changes nothing; leave that NIC at its defaults.
 
 ### NIC settings (ethtool, txqueuelen)
 
