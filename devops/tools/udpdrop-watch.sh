@@ -17,7 +17,8 @@ command -v ss >/dev/null || { echo "ss not found (package iproute2)" >&2; exit 1
 
 # One line per socket: "key drops rcvbuf recvq port inode"   (key = inode|local; kernel sockets all have inode 0)
 snap() {
-  ss -uameH 2>/dev/null | awk '
+  # -n: numeric ports (no /etc/services names like "sip" for 5060)
+  ss -uamenH 2>/dev/null | awk '
     /^[ \t]/ { line = line " " $0; next }          # skmem continuation line
     { if (line != "") print line; line = $0 }
     END { if (line != "") print line }' |
